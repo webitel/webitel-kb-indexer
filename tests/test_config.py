@@ -1,6 +1,7 @@
 import pytest
 
 from kb_indexer import config
+from tests.conftest import AMQP, DSN
 
 
 def test_load_reads_the_environment(complete_env):
@@ -25,7 +26,7 @@ def test_load_reads_the_environment(complete_env):
 )
 def test_incomplete_configuration_names_every_missing_variable(monkeypatch, present, missing):
     if present:
-        monkeypatch.setenv(present, "value://set")
+        monkeypatch.setenv(present, {"POSTGRES_DSN": DSN, "PUBSUB_URL": AMQP}[present])
 
     with pytest.raises(config.ConfigError) as failure:
         config.load(env_file=None)
@@ -73,3 +74,20 @@ def test_describe_reports_variable_names_and_no_credentials(monkeypatch):
     assert "secret" not in repr(described)
     assert described["POSTGRES_DSN"] == "***"
     assert described["LOG_LEVEL"] == "info"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "rabbit-host:5672",
+        "not a url",
+        "amqp://rabbit:notaport/",
+        "amqp://rabbit:5672/?heartbeat=often",
+    ],
+)
+def test_a_broker_url_that_cannot_be_dialled_is_a_configuration_error(complete_env, value):
+    """It must be reported at startup, not raised out of the running process."""
+    complete_env.setenv("PUBSUB_URL", value)
+
+    with pytest.raises(config.ConfigError, match="PUBSUB_URL"):
+        config.load(env_file=None)

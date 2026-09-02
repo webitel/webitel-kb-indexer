@@ -2,6 +2,7 @@ import os
 import signal
 import threading
 from contextlib import contextmanager
+from typing import ClassVar
 
 import pytest
 
@@ -13,7 +14,31 @@ def settings(complete_env):
     return config.load(env_file=None)
 
 
-def test_the_components_are_left_before_the_process_returns(settings, monkeypatch):
+class FakeConsumer:
+    """A consumer that only runs until the process is asked to stop."""
+
+    made: ClassVar[list["FakeConsumer"]] = []
+
+    def __init__(self, url, handler, stopping, policy):
+        self.url = url
+        self.handler = handler
+        self.stopping = stopping
+        self.policy = policy
+        FakeConsumer.made.append(self)
+
+    def run(self):
+        self.stopping.wait()
+
+
+@pytest.fixture
+def consumer(monkeypatch):
+    FakeConsumer.made = []
+    monkeypatch.setattr(app, "Consumer", FakeConsumer)
+
+    return FakeConsumer
+
+
+def test_the_components_are_left_before_the_process_returns(settings, consumer, monkeypatch):
     journal = []
 
     @contextmanager
@@ -31,6 +56,27 @@ def test_the_components_are_left_before_the_process_returns(settings, monkeypatc
     assert journal == ["enter", "leave"]
 
 
+def test_the_consumer_is_given_the_configured_broker_and_policy(complete_env, consumer, monkeypatch):
+    complete_env.setenv("CONSUMER_RETRIES", "2")
+    complete_env.setenv("CONSUMER_RETRY_BACKOFF", "0.5")
+    complete_env.setenv("CONSUMER_SHUTDOWN_TIMEOUT", "7")
+    monkeypatch.setattr(app, "telemetry", lambda *_args, **_kwargs: _nothing())
+    threading.Timer(0.2, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+
+    settings = config.load(env_file=None)
+
+    assert app.run(settings) == 0
+
+    built = consumer.made[-1]
+    assert built.url == settings.pubsub_url
+    assert (built.policy.retries, built.policy.retry_backoff, built.policy.shutdown_timeout) == (2, 0.5, 7.0)
+
+
+@contextmanager
+def _nothing():
+    yield
+
+
 class Refuses:
     """A component that fails while it is being entered."""
 
@@ -45,7 +91,7 @@ class Refuses:
         return False
 
 
-def test_a_component_that_cannot_start_stops_the_process(settings, monkeypatch):
+def test_a_component_that_cannot_start_stops_the_process(settings, consumer, monkeypatch):
     monkeypatch.setattr(app, "telemetry", Refuses)
     # A safety net: a lifecycle that swallowed the failure would wait for a
     # signal forever, and a hanging test says far less than a failing one.

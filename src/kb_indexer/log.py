@@ -17,6 +17,10 @@ _LEVELS = {
     "error": logging.ERROR,
 }
 
+# Libraries that narrate their own internals at info level. That is debugging
+# detail, so it is only let through when the service itself is debugging.
+NOISY = ("pika",)
+
 # Attributes every LogRecord carries; anything else came from the call site.
 _BUILTIN_FIELDS = frozenset(
     vars(logging.LogRecord(name="", level=0, pathname="", lineno=0, msg="", args=(), exc_info=None)),
@@ -95,6 +99,9 @@ def configure(*, level: str = "info", json_format: bool = True, console: bool = 
         root.addHandler(handler)
 
     root.setLevel(_LEVELS[level])
+
+    for name in NOISY:
+        logging.getLogger(name).setLevel(logging.NOTSET if _LEVELS[level] == logging.DEBUG else logging.WARNING)
 
     if silenced:
         root.warning("no log sink configured, falling back to stdout")

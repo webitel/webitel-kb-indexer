@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import ValidationError, field_validator
+import pika
+from pydantic import Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LOG_LEVELS = frozenset({"debug", "info", "warn", "warning", "error"})
@@ -36,11 +37,31 @@ class Settings(BaseSettings):
     # Service discovery, used once the consumer registers the instance.
     consul_addr: str = ""
 
+    # How stubborn the worker is with one message. The rest of the delivery
+    # rules are contract, not configuration.
+    consumer_retries: int = Field(default=5, ge=0)
+    consumer_retry_backoff: float = Field(default=1.0, gt=0)
+    consumer_shutdown_timeout: float = Field(default=30.0, gt=0)
+
     log_level: str = "info"
     log_json: bool = True
     log_console: bool = True
     log_file: str = ""
     log_otel: bool = False
+
+    @field_validator("pubsub_url")
+    @classmethod
+    def _usable_broker_url(cls, value: str) -> str:
+        # Asking the client that will dial it, rather than restating its rules:
+        # an unusable url must be reported here, not crash the running process.
+        if value.strip():
+            try:
+                pika.URLParameters(value)
+            except Exception as exc:
+                msg = f"unusable broker url: {exc}"
+                raise ValueError(msg) from exc
+
+        return value
 
     @field_validator("log_level")
     @classmethod

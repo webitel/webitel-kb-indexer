@@ -9,6 +9,8 @@ from contextlib import ExitStack
 
 from kb_indexer import SERVICE_NAME, SERVICE_VERSION
 from kb_indexer.config import Settings
+from kb_indexer.consumer import Consumer, Policy
+from kb_indexer.handler import LoggingHandler
 from kb_indexer.telemetry import telemetry
 
 log = logging.getLogger(__name__)
@@ -27,8 +29,19 @@ def run(settings: Settings) -> int:
     with ExitStack() as stack:
         stack.enter_context(telemetry(SERVICE_NAME, SERVICE_VERSION, export_logs=settings.log_otel))
 
+        consumer = Consumer(
+            url=settings.pubsub_url,
+            handler=LoggingHandler(),
+            stopping=stopping,
+            policy=Policy(
+                retries=settings.consumer_retries,
+                retry_backoff=settings.consumer_retry_backoff,
+                shutdown_timeout=settings.consumer_shutdown_timeout,
+            ),
+        )
+
         log.info("indexer started", extra={"version": SERVICE_VERSION})
-        stopping.wait()
+        consumer.run()
         log.info("indexer stopping")
 
     log.info("indexer stopped")

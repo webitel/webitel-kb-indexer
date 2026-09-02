@@ -66,3 +66,18 @@ def test_a_configuration_without_a_sink_still_logs(capsys):
 def test_an_unknown_level_is_rejected_by_name():
     with pytest.raises(ValueError, match="unknown log level"):
         configure(level="chatty")
+
+
+@pytest.mark.parametrize(
+    ("level", "expected"),
+    [("info", logging.WARNING), ("warn", logging.WARNING), ("debug", logging.NOTSET)],
+)
+def test_a_library_narrating_itself_is_quiet_unless_we_are_debugging(level, expected):
+    narrator = logging.getLogger("pika")
+    restore = narrator.level
+    try:
+        configure(level=level, console=False, file="")
+
+        assert narrator.level == expected
+    finally:
+        narrator.setLevel(restore)
