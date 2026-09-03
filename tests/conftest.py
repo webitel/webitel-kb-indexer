@@ -3,6 +3,22 @@ import pytest
 from kb_indexer.config import Settings
 from kb_indexer.telemetry import ENDPOINT_VARS
 
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--update-golden",
+        action="store_true",
+        default=False,
+        help="rewrite the recorded chunking output instead of comparing against it",
+    )
+
+
+@pytest.fixture
+def update_golden(request):
+    """Whether a golden file is rewritten rather than asserted."""
+    return request.config.getoption("--update-golden")
+
+
 # Every variable the process reads, derived from the settings themselves so a
 # new field cannot quietly escape the isolation below.
 _VARIABLES = tuple(name.upper() for name in Settings.model_fields) + ENDPOINT_VARS
