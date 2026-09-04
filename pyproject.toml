@@ -44,7 +44,9 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["ANN", "ARG001", "ARG002", "PLR2004", "S101", "S104", "SLF001"]
+# RUF001: article text in this product is Cyrillic, and the fixtures have to be
+# real text rather than transliterated Latin.
+"tests/*" = ["ANN", "ARG001", "ARG002", "PLR2004", "RUF001", "S101", "S104", "SLF001"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["kb_indexer"]
