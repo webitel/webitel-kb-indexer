@@ -6,6 +6,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import pika
+from psycopg import conninfo
 from pydantic import Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -48,6 +49,18 @@ class Settings(BaseSettings):
     log_console: bool = True
     log_file: str = ""
     log_otel: bool = False
+
+    @field_validator("postgres_dsn")
+    @classmethod
+    def _usable_database_dsn(cls, value: str) -> str:
+        if value.strip():
+            try:
+                conninfo.conninfo_to_dict(value)
+            except Exception as exc:
+                msg = f"unusable database dsn: {exc}"
+                raise ValueError(msg) from exc
+
+        return value
 
     @field_validator("pubsub_url")
     @classmethod
