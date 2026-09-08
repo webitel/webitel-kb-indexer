@@ -66,7 +66,7 @@ def test_mask_url_hides_only_the_password(value, expected):
 
 
 def test_describe_reports_variable_names_and_no_credentials(monkeypatch):
-    monkeypatch.setenv("POSTGRES_DSN", "postgres://[unclosed")
+    monkeypatch.setenv("POSTGRES_DSN", "host=db user=kb password=secret")
     monkeypatch.setenv("PUBSUB_URL", "amqp://webitel:secret@rabbit:5672/")
 
     described = config.load(env_file=None).describe()
@@ -90,4 +90,19 @@ def test_a_broker_url_that_cannot_be_dialled_is_a_configuration_error(complete_e
     complete_env.setenv("PUBSUB_URL", value)
 
     with pytest.raises(config.ConfigError, match="PUBSUB_URL"):
+        config.load(env_file=None)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "not a dsn",
+        "postgres://[unclosed",
+    ],
+)
+def test_a_database_dsn_that_cannot_be_dialled_is_a_configuration_error(complete_env, value):
+    """It must be reported at startup, not raised out of the running process."""
+    complete_env.setenv("POSTGRES_DSN", value)
+
+    with pytest.raises(config.ConfigError, match="POSTGRES_DSN"):
         config.load(env_file=None)
