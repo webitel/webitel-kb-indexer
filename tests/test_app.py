@@ -8,6 +8,7 @@ import pytest
 
 from kb_indexer import app, config
 from kb_indexer.indexing import IndexingHandler
+from kb_indexer.resolver import Cached
 
 
 @pytest.fixture
@@ -18,6 +19,16 @@ def settings(complete_env):
 class FakeStore:
     def __init__(self, dsn):
         self.dsn = dsn
+
+
+class FakeResolver:
+    def __init__(self, settings):
+        self.settings = settings
+
+
+class FakeProviders:
+    def __init__(self, timeout):
+        self.timeout = timeout
 
 
 @pytest.fixture(autouse=True)
@@ -32,6 +43,27 @@ def database(monkeypatch):
         yield store
 
     monkeypatch.setattr(app, "connect", fake_connect)
+
+    return opened
+
+
+@pytest.fixture(autouse=True)
+def kb_api(monkeypatch):
+    """A unit test must not dial kb-api either."""
+    opened = []
+
+    @contextmanager
+    def fake_connect(settings):
+        resolver = FakeResolver(settings)
+        opened.append(resolver)
+        yield resolver
+
+    @contextmanager
+    def fake_providers(timeout):
+        yield FakeProviders(timeout)
+
+    monkeypatch.setattr(app, "connect_kb_api", fake_connect)
+    monkeypatch.setattr(app, "providers", fake_providers)
 
     return opened
 
@@ -103,6 +135,19 @@ def test_the_pipeline_is_given_the_configured_database(settings, consumer, datab
     built = consumer.made[-1]
     assert isinstance(built.handler, IndexingHandler)
     assert database[-1].dsn == settings.postgres_dsn
+
+
+def test_the_pipeline_is_given_the_configured_kb_api(settings, consumer, kb_api, monkeypatch):
+    monkeypatch.setattr(app, "telemetry", lambda *_args, **_kwargs: _nothing())
+    threading.Timer(0.2, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+
+    assert app.run(settings) == 0
+
+    built = consumer.made[-1]
+    assert kb_api[-1].settings is settings
+    # The resolved model is remembered, so one delivery does not ask twice.
+    assert isinstance(built.handler._resolver, Cached)
+    assert built.handler._providers.timeout == settings.embedding_timeout
 
 
 @contextmanager

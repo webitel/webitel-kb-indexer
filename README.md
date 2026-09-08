@@ -19,6 +19,18 @@ uv run kb-indexer config   # effective configuration, credentials masked
 uv run kb-indexer run
 ```
 
+## Generated code
+Regenerate with:
+
+```sh
+stage=$(mktemp -d)
+buf export 'https://github.com/webitel/protos.git#branch=main,subdir=kb' \
+    --path service/indexing.proto -o "$stage"
+mkdir -p "$stage/kb_indexer/kbapi"
+mv "$stage/service/indexing.proto" "$stage/kb_indexer/kbapi/"
+buf generate "$stage"
+```
+
 ## Checks
 
 ```sh

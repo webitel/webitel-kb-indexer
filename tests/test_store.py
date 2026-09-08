@@ -8,11 +8,12 @@ from psycopg_pool import ConnectionPool
 
 from kb_indexer import store as store_module
 from kb_indexer.handler import PermanentError, TransientError
-from kb_indexer.store import FAILED, INDEXED, INDEXING, Job, Store, connect
+from kb_indexer.store import FAILED, INDEXED, INDEXING, Job, Store, connect, vector_literal
 
 JOB = Job(
     version_id=7,
     article_id=3,
+    space_id=5,
     version_number=2,
     subject="Скидання пароля",
     body_markdown="# Скидання\n\nТекст.",
@@ -43,6 +44,9 @@ class FakeCursor:
     def execute(self, sql, params=None):
         self.calls.append((compact(sql), params))
         self._rows = self._results.pop(0) if self._results else []
+
+    def executemany(self, sql, params_seq):
+        self.calls.append((compact(sql), list(params_seq)))
 
     def fetchone(self):
         return self._rows[0] if self._rows else None
@@ -109,6 +113,7 @@ def test_the_job_is_read_by_version_alone():
 
     sql, params = cursor.calls[0]
     assert params == {"version_id": 7}
+    assert "SELECT v.id AS version_id, v.article_id, a.space_id," in sql
     assert "JOIN kb.article a ON a.id = v.article_id" in sql
     assert "JOIN kb.space s ON s.id = a.space_id" in sql
     assert "WHERE v.id = %(version_id)s" in sql
@@ -161,6 +166,46 @@ def test_a_body_that_yields_nothing_leaves_no_chunks_behind():
 
     _stale, _upsert, tail = cursor.calls
     assert tail[1] == {"version_id": 7, "count": 0}
+
+
+def test_the_chunks_that_already_carry_a_vector_are_named():
+    store, cursor = build(results=[[(11,), (13,)]])
+
+    assert store.embedded(4, [11, 12, 13]) == {11, 13}
+
+    sql, params = cursor.calls[0]
+    assert params == {"model_id": 4, "chunk_ids": [11, 12, 13]}
+    assert "SELECT chunk_id FROM kb.chunk_embedding" in sql
+    assert "WHERE model_id = %(model_id)s AND chunk_id = ANY(%(chunk_ids)s)" in sql
+
+
+def test_a_vector_replaces_the_one_the_chunk_carried():
+    store, cursor = build()
+
+    store.write_embeddings(4, [(11, [1.0, 0.0]), (12, [0.0, 1.0])])
+
+    sql, rows = cursor.calls[0]
+    assert "INSERT INTO kb.chunk_embedding (chunk_id, model_id, embedding)" in sql
+    assert "%(embedding)s::vector" in sql
+    assert "ON CONFLICT (chunk_id, model_id) DO UPDATE" in sql
+    assert rows == [
+        {"chunk_id": 11, "model_id": 4, "embedding": "[1.0,0.0]"},
+        {"chunk_id": 12, "model_id": 4, "embedding": "[0.0,1.0]"},
+    ]
+
+
+def test_the_vectors_of_one_job_are_written_in_one_transaction():
+    pool = FakePool(FakeCursor([]))
+    store = Store(cast(ConnectionPool[Connection[TupleRow]], pool))
+
+    store.write_embeddings(4, [(11, [1.0]), (12, [0.0])])
+
+    assert pool.connection_calls == 1
+
+
+def test_a_vector_is_written_the_way_pgvector_reads_one():
+    assert vector_literal([1.5, -0.25, 0.0]) == "[1.5,-0.25,0.0]"
+    assert vector_literal([]) == "[]"
 
 
 @pytest.mark.parametrize(

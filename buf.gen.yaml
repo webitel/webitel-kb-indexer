@@ -1,0 +1,15 @@
+version: v2
+
+plugins:
+  - remote: buf.build/protocolbuffers/python
+    out: src
+
+  - remote: buf.build/grpc/python
+    out: src
+
+  # Type stubs, so the generated client is checked like the rest of the code.
+  - remote: buf.build/community/nipunn1313-mypy
+    out: src
+
+  - remote: buf.build/community/nipunn1313-mypy-grpc
+    out: src

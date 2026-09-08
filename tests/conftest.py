@@ -25,6 +25,8 @@ _VARIABLES = tuple(name.upper() for name in Settings.model_fields) + ENDPOINT_VA
 
 DSN = "postgres://kb:secret@db:5432/webitel"
 AMQP = "amqp://webitel:secret@rabbit:5672/"
+KB_API = "kb-api:8080"
+TOKEN = "0123456789abcdef0123456789abcdef"
 
 
 @pytest.fixture(autouse=True)
@@ -39,5 +41,7 @@ def complete_env(monkeypatch):
     """The minimum the process needs to start."""
     monkeypatch.setenv("POSTGRES_DSN", DSN)
     monkeypatch.setenv("PUBSUB_URL", AMQP)
+    monkeypatch.setenv("KB_API_ADDR", KB_API)
+    monkeypatch.setenv("KB_API_SERVICE_TOKEN", TOKEN)
 
     return monkeypatch
