@@ -3,34 +3,33 @@ import pathlib
 import pytest
 
 from kb_indexer import config
-from tests.conftest import AMQP, DSN, KB_API, TOKEN
+from tests.conftest import AMQP, CONSUL, DSN, TOKEN
 
 
 def test_load_reads_the_environment(complete_env):
     complete_env.setenv("LOG_LEVEL", "DEBUG")
     complete_env.setenv("LOG_JSON", "false")
-    complete_env.setenv("CONSUL_ADDR", "consul:8500")
-
     settings = config.load(env_file=None)
 
     assert settings.log_level == "debug"
     assert settings.log_json is False
-    assert settings.consul_addr == "consul:8500"
+    assert settings.consul_addr == CONSUL
+    assert settings.kb_api_service == "webitel-kb"
 
 
 @pytest.mark.parametrize(
     ("present", "missing"),
     [
-        (None, ["POSTGRES_DSN", "PUBSUB_URL", "KB_API_ADDR", "KB_API_SERVICE_TOKEN"]),
-        ("POSTGRES_DSN", ["PUBSUB_URL", "KB_API_ADDR", "KB_API_SERVICE_TOKEN"]),
-        ("PUBSUB_URL", ["POSTGRES_DSN", "KB_API_ADDR", "KB_API_SERVICE_TOKEN"]),
-        ("KB_API_ADDR", ["POSTGRES_DSN", "PUBSUB_URL", "KB_API_SERVICE_TOKEN"]),
-        ("KB_API_SERVICE_TOKEN", ["POSTGRES_DSN", "PUBSUB_URL", "KB_API_ADDR"]),
+        (None, ["POSTGRES_DSN", "PUBSUB_URL", "CONSUL_ADDR", "KB_API_SERVICE_TOKEN"]),
+        ("POSTGRES_DSN", ["PUBSUB_URL", "CONSUL_ADDR", "KB_API_SERVICE_TOKEN"]),
+        ("PUBSUB_URL", ["POSTGRES_DSN", "CONSUL_ADDR", "KB_API_SERVICE_TOKEN"]),
+        ("CONSUL_ADDR", ["POSTGRES_DSN", "PUBSUB_URL", "KB_API_SERVICE_TOKEN"]),
+        ("KB_API_SERVICE_TOKEN", ["POSTGRES_DSN", "PUBSUB_URL", "CONSUL_ADDR"]),
     ],
 )
 def test_incomplete_configuration_names_every_missing_variable(monkeypatch, present, missing):
     if present:
-        values = {"POSTGRES_DSN": DSN, "PUBSUB_URL": AMQP, "KB_API_ADDR": KB_API, "KB_API_SERVICE_TOKEN": TOKEN}
+        values = {"POSTGRES_DSN": DSN, "PUBSUB_URL": AMQP, "CONSUL_ADDR": CONSUL, "KB_API_SERVICE_TOKEN": TOKEN}
         monkeypatch.setenv(present, values[present])
 
     with pytest.raises(config.ConfigError) as failure:
@@ -40,6 +39,13 @@ def test_incomplete_configuration_names_every_missing_variable(monkeypatch, pres
     assert all(name in message for name in missing)
     if present:
         assert present not in message
+
+
+def test_kb_api_cannot_be_looked_up_without_a_name(complete_env):
+    complete_env.setenv("KB_API_SERVICE", "   ")
+
+    with pytest.raises(config.ConfigError, match="KB_API_SERVICE"):
+        config.load(env_file=None)
 
 
 def test_blank_value_counts_as_missing(complete_env):
@@ -116,7 +122,7 @@ def test_a_database_dsn_that_cannot_be_dialled_is_a_configuration_error(complete
 def test_the_kb_api_settings_have_defaults_that_do_not_have_to_be_set(complete_env):
     settings = config.load(env_file=None)
 
-    assert settings.kb_api_addr == KB_API
+    assert settings.kb_api_service == "webitel-kb"
     assert settings.kb_api_service_token == TOKEN
     assert settings.kb_api_tls is False
     assert (settings.kb_api_timeout, settings.embedding_timeout, settings.embedding_cache_ttl) == (5.0, 30.0, 300.0)

@@ -6,10 +6,19 @@ from typing import ClassVar
 import grpc
 import pytest
 
-from kb_indexer import config
+from kb_indexer import config, discovery
+from kb_indexer.discovery import Instance
 from kb_indexer.handler import PermanentError, TransientError
 from kb_indexer.kbapi import indexing_pb2, indexing_pb2_grpc
-from kb_indexer.resolver import SERVICE_TOKEN_HEADER, Cached, Resolver, SpaceEmbedding, connect
+from kb_indexer.resolver import (
+    CHANNEL_OPTIONS,
+    SERVICE_TOKEN_HEADER,
+    Cached,
+    Reconnecting,
+    Resolver,
+    SpaceEmbedding,
+    connect,
+)
 from tests.conftest import TOKEN
 
 ANSWER = indexing_pb2.SpaceEmbedding(
@@ -209,44 +218,199 @@ def test_each_space_is_remembered_on_its_own():
     assert kb_api.spaces == [5, 6]
 
 
+ADDRESS = "10.0.0.4:22106"
+
+
+class Refused(grpc.RpcError):
+    """A call kb-api never answered."""
+
+    def __init__(self, code):
+        self._code = code
+
+    def code(self):
+        return self._code
+
+    def details(self):
+        return "the call was refused"
+
+
 class FakeChannel:
     made: ClassVar[list["FakeChannel"]] = []
+    raises: ClassVar[Exception | None] = None
 
-    def __init__(self, addr, credentials=None):
-        self.addr = addr
+    def __init__(self, target, credentials=None, options=None):
+        self.target = target
         self.credentials = credentials
+        self.options = options
         self.closed = False
         FakeChannel.made.append(self)
 
     def unary_unary(self, *_args, **_kwargs):
         """Enough of a channel for a stub to be built on it."""
-        return lambda *_call, **_options: None
+
+        def call(*_call, **_options):
+            if self.closed:
+                # What grpc itself raises for a call on a closed channel.
+                raise ValueError("Cannot invoke RPC on closed channel!")
+
+            if FakeChannel.raises is not None:
+                raise FakeChannel.raises
+
+            return ANSWER
+
+        return call
 
     def close(self):
         self.closed = True
 
 
+class Racing(Reconnecting):
+    """A resolver whose channel is given up between opening it and the call."""
+
+    def _open(self):
+        resolver, channel = super()._open()
+        self._drop(channel)
+
+        return resolver, channel
+
+
 @pytest.fixture
 def channels(monkeypatch):
     FakeChannel.made = []
+    FakeChannel.raises = None
     monkeypatch.setattr(grpc, "insecure_channel", FakeChannel)
     monkeypatch.setattr(grpc, "secure_channel", FakeChannel)
 
     return FakeChannel
 
 
+@pytest.fixture
+def looked_up(monkeypatch):
+    """kb-api, as consul hands it over."""
+
+    def found(*instances):
+        asked = []
+
+        def lookup(consul_addr, service, *_args, **_kwargs):
+            asked.append((consul_addr, service))
+
+            return list(instances)
+
+        monkeypatch.setattr(discovery, "lookup", lookup)
+
+        return asked
+
+    return found
+
+
 @pytest.mark.parametrize("tls", [False, True])
-def test_the_channel_is_closed_when_the_process_leaves(complete_env, channels, tls):
+def test_the_channel_is_closed_when_the_process_leaves(complete_env, channels, looked_up, tls):
+    asked = looked_up(Instance("10.0.0.4", 22106))
     complete_env.setenv("KB_API_TLS", str(tls).lower())
     settings = config.load(env_file=None)
 
     with connect(settings) as resolver:
-        assert isinstance(resolver, Resolver)
+        resolver.resolve(5)
+
+    assert asked == [(settings.consul_addr, "webitel-kb")]
 
     channel = channels.made[-1]
-    assert channel.addr == settings.kb_api_addr
+    assert channel.target == "ipv4:10.0.0.4:22106"
     assert (channel.credentials is not None) is tls
+    assert channel.options == CHANNEL_OPTIONS
     assert channel.closed
+
+
+def test_nothing_is_looked_up_or_dialed_before_the_first_call(complete_env, channels, looked_up):
+    asked = looked_up(Instance("10.0.0.4", 22106))
+
+    with connect(config.load(env_file=None)):
+        pass
+
+    assert asked == []
+    assert channels.made == []
+
+
+def test_every_instance_consul_knows_takes_calls(complete_env, channels, looked_up):
+    looked_up(Instance("10.0.0.4", 22106), Instance("10.0.0.5", 22106))
+
+    with connect(config.load(env_file=None)) as resolver:
+        resolver.resolve(5)
+
+    assert channels.made[-1].target == "ipv4:10.0.0.4:22106,10.0.0.5:22106"
+
+
+def test_the_channel_is_opened_once_and_reused(channels):
+    reconnecting = Reconnecting(lambda: ADDRESS, False, TOKEN, 5.0)
+
+    reconnecting.resolve(5)
+    reconnecting.resolve(6)
+    reconnecting.close()
+
+    assert len(channels.made) == 1
+
+
+def test_a_failed_call_gives_up_the_channel_so_the_next_one_is_looked_up_again(channels):
+    targets = iter(["10.0.0.4:22106", "10.0.0.5:22106"])
+    reconnecting = Reconnecting(lambda: next(targets), False, TOKEN, 5.0)
+
+    channels.raises = Refused(grpc.StatusCode.UNAVAILABLE)
+    with pytest.raises(TransientError):
+        reconnecting.resolve(5)
+
+    channels.raises = None
+    reconnecting.resolve(5)
+    reconnecting.close()
+
+    assert [channel.target for channel in channels.made] == ["10.0.0.4:22106", "10.0.0.5:22106"]
+    assert channels.made[0].closed
+
+
+def test_a_refusal_that_no_attempt_can_fix_keeps_the_channel(channels):
+    reconnecting = Reconnecting(lambda: ADDRESS, False, TOKEN, 5.0)
+
+    channels.raises = Refused(grpc.StatusCode.PERMISSION_DENIED)
+    with pytest.raises(PermanentError):
+        reconnecting.resolve(5)
+
+    channels.raises = None
+    reconnecting.resolve(5)
+    reconnecting.close()
+
+    assert len(channels.made) == 1
+
+
+def test_a_consul_that_cannot_be_asked_leaves_nothing_open(channels):
+    def lookup():
+        raise TransientError("consul did not answer")
+
+    reconnecting = Reconnecting(lookup, False, TOKEN, 5.0)
+
+    with pytest.raises(TransientError):
+        reconnecting.resolve(5)
+
+    reconnecting.close()
+
+    assert channels.made == []
+
+
+def test_a_channel_given_up_under_a_call_is_worth_another_attempt(channels):
+    # Two deliveries overlap: one fails and closes the channel while the call
+    # of the other is on its way to it.
+    racing = Racing(lambda: ADDRESS, False, TOKEN, 5.0)
+
+    with pytest.raises(TransientError, match="closed while the call was in flight"):
+        racing.resolve(5)
+
+
+def test_a_failure_that_is_not_the_channel_is_not_disguised(channels):
+    reconnecting = Reconnecting(lambda: ADDRESS, False, TOKEN, 5.0)
+
+    channels.raises = ValueError("the request could not be built")
+    with pytest.raises(ValueError, match="could not be built"):
+        reconnecting.resolve(5)
+
+    reconnecting.close()
 
 
 class Slow:

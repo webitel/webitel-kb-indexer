@@ -12,6 +12,7 @@ from typing import Protocol, cast
 
 import grpc
 
+from kb_indexer import discovery
 from kb_indexer.config import Settings
 from kb_indexer.handler import PermanentError, TransientError
 from kb_indexer.kbapi import indexing_pb2, indexing_pb2_grpc
@@ -20,6 +21,9 @@ log = logging.getLogger(__name__)
 
 # What kb-api authorizes a service call by.
 SERVICE_TOKEN_HEADER = "x-webitel-service-token"  # noqa: S105
+
+# Every healthy instance gets calls. With one address it changes nothing.
+CHANNEL_OPTIONS = (("grpc.service_config", '{"loadBalancingConfig": [{"round_robin": {}}]}'),)
 
 # Failures worth another attempt: the service is down, slow, overloaded, or
 # broke on its own side. Everything else describes this worker or the
@@ -102,6 +106,78 @@ class Answering(Protocol):
         ...
 
 
+class Reconnecting:
+    """A resolver that opens the channel when it is needed and drops it when a
+    call fails."""
+
+    def __init__(self, target: Callable[[], str], tls: bool, token: str, timeout: float) -> None:
+        self._target = target
+        self._tls = tls
+        self._token = token
+        self._timeout = timeout
+        self._lock = threading.Lock()
+        self._channel: grpc.Channel | None = None
+        self._resolver: Resolver | None = None
+
+    def resolve(self, space_id: int) -> SpaceEmbedding | None:
+        """The model of the space, over the channel of the moment."""
+        resolver, channel = self._open()
+
+        try:
+            return resolver.resolve(space_id)
+        except TransientError:
+            self._drop(channel)
+
+            raise
+        except ValueError:
+            # A call on a channel that was closed under it is a ValueError
+            # rather than a refusal. It is ours only when the channel was
+            # given up meanwhile: another delivery failed, or we are stopping.
+            if not self._given_up(channel):
+                raise
+
+            msg = "the channel to kb-api was closed while the call was in flight"
+            raise TransientError(msg) from None
+
+    def close(self) -> None:
+        """Close the channel, if one was ever opened."""
+        self._drop(self._channel)
+
+    def _open(self) -> tuple[Resolver, grpc.Channel]:
+        """The channel and its resolver, opening them on the first call."""
+        with self._lock:
+            if self._resolver is None or self._channel is None:
+                target = self._target()
+                self._channel = (
+                    grpc.secure_channel(target, grpc.ssl_channel_credentials(), options=CHANNEL_OPTIONS)
+                    if self._tls
+                    else grpc.insecure_channel(target, options=CHANNEL_OPTIONS)
+                )
+                self._resolver = Resolver(self._channel, self._token, self._timeout)
+                log.info("kb-api channel opened", extra={"target": target, "tls": self._tls})
+
+            return self._resolver, self._channel
+
+    def _given_up(self, channel: grpc.Channel) -> bool:
+        """Whether the channel of the call is no longer the one in use."""
+        with self._lock:
+            return self._channel is not channel
+
+    def _drop(self, channel: grpc.Channel | None) -> None:
+        """Give up the channel, unless another thread already replaced it."""
+        if channel is None:
+            return
+
+        with self._lock:
+            if self._channel is not channel:
+                return
+
+            self._channel, self._resolver = None, None
+
+        channel.close()
+        log.info("kb-api channel closed")
+
+
 class Cached:
     """A resolver that reuses an answer for a while.
 
@@ -149,23 +225,20 @@ class Cached:
 
 
 @contextmanager
-def connect(settings: Settings) -> Iterator[Resolver]:
-    """Hold the channel to kb-api for as long as the process runs.
-
-    The channel dials lazily, so a kb-api that is down makes the deliveries
-    fail and be retried rather than stopping the worker from starting.
-    """
-    channel = (
-        grpc.secure_channel(settings.kb_api_addr, grpc.ssl_channel_credentials())
-        if settings.kb_api_tls
-        else grpc.insecure_channel(settings.kb_api_addr)
+def connect(settings: Settings) -> Iterator[Reconnecting]:
+    """Hold the connection to kb-api for as long as the process runs."""
+    consul_addr, service = settings.consul_addr, settings.kb_api_service
+    resolver = Reconnecting(
+        lambda: discovery.target(discovery.lookup(consul_addr, service)),
+        settings.kb_api_tls,
+        settings.kb_api_service_token,
+        settings.kb_api_timeout,
     )
-    log.info("kb-api channel opened", extra={"addr": settings.kb_api_addr, "tls": settings.kb_api_tls})
 
     try:
-        yield Resolver(channel, settings.kb_api_service_token, settings.kb_api_timeout)
+        yield resolver
     finally:
-        channel.close()
+        resolver.close()
 
 
 def _classified(error: grpc.Call) -> Exception:

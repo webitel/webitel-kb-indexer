@@ -19,7 +19,7 @@ MASKED = "***"
 
 # Fields the worker cannot run without, fields that may carry a password inside
 # a url, and fields that are a secret whole.
-REQUIRED = ("postgres_dsn", "pubsub_url", "kb_api_addr", "kb_api_service_token")
+REQUIRED = ("postgres_dsn", "pubsub_url", "consul_addr", "kb_api_service_token")
 CREDENTIALS = ("postgres_dsn", "pubsub_url")
 SECRETS = ("kb_api_service_token",)
 
@@ -41,12 +41,12 @@ class Settings(BaseSettings):
     postgres_dsn: str = ""
     # The broker carrying the re-indexing queue.
     pubsub_url: str = ""
-    # Service discovery, used once the consumer registers the instance.
+    # Service discovery: where kb-api is looked up.
     consul_addr: str = ""
 
     # kb-api, which tells the worker how a space is embedded and hands over the
-    # credential of that model.
-    kb_api_addr: str = ""
+    # credential of that model, under the name it is registered with.
+    kb_api_service: str = "webitel-kb"
     kb_api_service_token: str = ""
     kb_api_tls: bool = False
     kb_api_timeout: float = Field(default=5.0, gt=0)
@@ -84,6 +84,15 @@ class Settings(BaseSettings):
     def _long_enough_token(cls, value: str) -> str:
         if value.strip() and len(value) < MIN_TOKEN_LENGTH:
             msg = f"service token must be at least {MIN_TOKEN_LENGTH} characters"
+            raise ValueError(msg)
+
+        return value
+
+    @field_validator("kb_api_service")
+    @classmethod
+    def _named_service(cls, value: str) -> str:
+        if not value.strip():
+            msg = "the name kb-api is registered under cannot be empty"
             raise ValueError(msg)
 
         return value
