@@ -14,6 +14,7 @@ JOB = Job(
     version_id=7,
     article_id=3,
     space_id=5,
+    domain_id=1,
     version_number=2,
     subject="Скидання пароля",
     body_markdown="# Скидання\n\nТекст.",
@@ -113,7 +114,7 @@ def test_the_job_is_read_by_version_alone():
 
     sql, params = cursor.calls[0]
     assert params == {"version_id": 7}
-    assert "SELECT v.id AS version_id, v.article_id, a.space_id," in sql
+    assert "SELECT v.id AS version_id, v.article_id, a.space_id, s.domain_id," in compact(sql)
     assert "JOIN kb.article a ON a.id = v.article_id" in sql
     assert "JOIN kb.space s ON s.id = a.space_id" in sql
     assert "WHERE v.id = %(version_id)s" in sql
@@ -182,15 +183,15 @@ def test_the_chunks_that_already_carry_a_vector_are_named():
 def test_a_vector_replaces_the_one_the_chunk_carried():
     store, cursor = build()
 
-    store.write_embeddings(4, [(11, [1.0, 0.0]), (12, [0.0, 1.0])])
+    store.write_embeddings(JOB, 4, [(11, [1.0, 0.0]), (12, [0.0, 1.0])])
 
     sql, rows = cursor.calls[0]
-    assert "INSERT INTO kb.chunk_embedding (chunk_id, model_id, embedding)" in sql
+    assert "INSERT INTO kb.chunk_embedding (chunk_id, model_id, domain_id, space_id, embedding)" in sql
     assert "%(embedding)s::vector" in sql
     assert "ON CONFLICT (chunk_id, model_id) DO UPDATE" in sql
     assert rows == [
-        {"chunk_id": 11, "model_id": 4, "embedding": "[1.0,0.0]"},
-        {"chunk_id": 12, "model_id": 4, "embedding": "[0.0,1.0]"},
+        {"chunk_id": 11, "model_id": 4, "domain_id": 1, "space_id": 5, "embedding": "[1.0,0.0]"},
+        {"chunk_id": 12, "model_id": 4, "domain_id": 1, "space_id": 5, "embedding": "[0.0,1.0]"},
     ]
 
 
@@ -198,7 +199,7 @@ def test_the_vectors_of_one_job_are_written_in_one_transaction():
     pool = FakePool(FakeCursor([]))
     store = Store(cast(ConnectionPool[Connection[TupleRow]], pool))
 
-    store.write_embeddings(4, [(11, [1.0]), (12, [0.0])])
+    store.write_embeddings(JOB, 4, [(11, [1.0]), (12, [0.0])])
 
     assert pool.connection_calls == 1
 
