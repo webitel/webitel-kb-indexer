@@ -29,6 +29,7 @@ POOL_MAX = 2
 JOB_SQL = """
 SELECT v.id AS version_id,
        v.article_id,
+       a.space_id,
        v.version_number,
        v.subject,
        v.body_markdown,
@@ -105,6 +106,21 @@ WHERE c.version_id = v.id
       )
 """
 
+# Which of these chunks the model has already been run over. A repeat of a
+# delivery, and a retry after a failed batch, then cost the provider nothing.
+EMBEDDED_SQL = """
+SELECT chunk_id FROM kb.chunk_embedding
+WHERE model_id = %(model_id)s AND chunk_id = ANY(%(chunk_ids)s)
+"""
+
+# One vector per chunk and model: a repeat replaces it.
+WRITE_EMBEDDING_SQL = """
+INSERT INTO kb.chunk_embedding (chunk_id, model_id, embedding)
+VALUES (%(chunk_id)s, %(model_id)s, %(embedding)s::vector)
+ON CONFLICT (chunk_id, model_id) DO UPDATE
+SET embedding = EXCLUDED.embedding, created_at = now()
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class Job:
@@ -112,6 +128,7 @@ class Job:
 
     version_id: int
     article_id: int
+    space_id: int
     version_number: int
     subject: str
     body_markdown: str
@@ -173,6 +190,24 @@ class Store:
 
         return published is not None and published[0] == version_id
 
+    def embedded(self, model_id: int, chunk_ids: list[int]) -> set[int]:
+        """Which of the chunks already carry a vector of the model."""
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(EMBEDDED_SQL, {"model_id": model_id, "chunk_ids": chunk_ids})
+            found = cursor.fetchall()
+
+        return {chunk_id for (chunk_id,) in found}
+
+    def write_embeddings(self, model_id: int, vectors: list[tuple[int, list[float]]]) -> None:
+        """Store the vectors of chunks under the model."""
+        rows = [
+            {"chunk_id": chunk_id, "model_id": model_id, "embedding": vector_literal(vector)}
+            for chunk_id, vector in vectors
+        ]
+
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.executemany(WRITE_EMBEDDING_SQL, rows)
+
     def _mark(self, article_id: int, state: int) -> None:
         with self._connection() as connection, connection.cursor() as cursor:
             cursor.execute(STATE_SQL, {"article_id": article_id, "state": state})
@@ -189,6 +224,11 @@ class Store:
         except psycopg.Error as refused:
             msg = f"the database refused the statement: {refused}"
             raise PermanentError(msg) from refused
+
+
+def vector_literal(vector: list[float]) -> str:
+    """A vector as pgvector reads it. The worker writes vectors and never reads one."""
+    return "[" + ",".join(repr(value) for value in vector) + "]"
 
 
 @contextmanager

@@ -17,9 +17,15 @@ DEFAULT_ENV_FILE = ".env"
 # Stands in for a value whose shape we cannot parse, so nothing leaks by default.
 MASKED = "***"
 
-# Fields the worker cannot run without, and fields that may carry a password.
-REQUIRED = ("postgres_dsn", "pubsub_url")
+# Fields the worker cannot run without, fields that may carry a password inside
+# a url, and fields that are a secret whole.
+REQUIRED = ("postgres_dsn", "pubsub_url", "consul_addr", "kb_api_service_token")
 CREDENTIALS = ("postgres_dsn", "pubsub_url")
+SECRETS = ("kb_api_service_token",)
+
+# What kb-api itself refuses to run with. Checking it here names the variable
+# rather than letting every call come back unauthenticated.
+MIN_TOKEN_LENGTH = 32
 
 
 class ConfigError(Exception):
@@ -35,8 +41,19 @@ class Settings(BaseSettings):
     postgres_dsn: str = ""
     # The broker carrying the re-indexing queue.
     pubsub_url: str = ""
-    # Service discovery, used once the consumer registers the instance.
+    # Service discovery: where kb-api is looked up.
     consul_addr: str = ""
+
+    # kb-api, which tells the worker how a space is embedded and hands over the
+    # credential of that model, under the name it is registered with.
+    kb_api_service: str = "webitel-kb"
+    kb_api_service_token: str = ""
+    kb_api_tls: bool = False
+    kb_api_timeout: float = Field(default=5.0, gt=0)
+
+    # How long a resolved model is reused, and how long one provider call may take.
+    embedding_cache_ttl: float = Field(default=300.0, ge=0)
+    embedding_timeout: float = Field(default=30.0, gt=0)
 
     # How stubborn the worker is with one message. The rest of the delivery
     # rules are contract, not configuration.
@@ -59,6 +76,24 @@ class Settings(BaseSettings):
             except Exception as exc:
                 msg = f"unusable database dsn: {exc}"
                 raise ValueError(msg) from exc
+
+        return value
+
+    @field_validator("kb_api_service_token")
+    @classmethod
+    def _long_enough_token(cls, value: str) -> str:
+        if value.strip() and len(value) < MIN_TOKEN_LENGTH:
+            msg = f"service token must be at least {MIN_TOKEN_LENGTH} characters"
+            raise ValueError(msg)
+
+        return value
+
+    @field_validator("kb_api_service")
+    @classmethod
+    def _named_service(cls, value: str) -> str:
+        if not value.strip():
+            msg = "the name kb-api is registered under cannot be empty"
+            raise ValueError(msg)
 
         return value
 
@@ -95,9 +130,7 @@ class Settings(BaseSettings):
 
     def describe(self) -> dict[str, Any]:
         """The effective configuration under its variable names, credentials masked."""
-        return {
-            name.upper(): mask_url(value) if name in CREDENTIALS else value for name, value in self.model_dump().items()
-        }
+        return {name.upper(): _shown(name, value) for name, value in self.model_dump().items()}
 
 
 def load(env_file: str | None = DEFAULT_ENV_FILE) -> Settings:
@@ -110,6 +143,17 @@ def load(env_file: str | None = DEFAULT_ENV_FILE) -> Settings:
     settings.require()
 
     return settings
+
+
+def _shown(name: str, value: Any) -> Any:
+    """One value of the dump: a secret whole, a password inside a url, or as it is."""
+    if name in SECRETS:
+        return MASKED if value else value
+
+    if name in CREDENTIALS:
+        return mask_url(value)
+
+    return value
 
 
 def mask_url(value: str) -> str:

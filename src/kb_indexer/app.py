@@ -10,7 +10,10 @@ from contextlib import ExitStack
 from kb_indexer import SERVICE_NAME, SERVICE_VERSION
 from kb_indexer.config import Settings
 from kb_indexer.consumer import Consumer, Policy
+from kb_indexer.embedding import providers
 from kb_indexer.indexing import IndexingHandler
+from kb_indexer.resolver import Cached
+from kb_indexer.resolver import connect as connect_kb_api
 from kb_indexer.store import connect
 from kb_indexer.telemetry import telemetry
 
@@ -30,10 +33,16 @@ def run(settings: Settings) -> int:
     with ExitStack() as stack:
         stack.enter_context(telemetry(SERVICE_NAME, SERVICE_VERSION, export_logs=settings.log_otel))
         store = stack.enter_context(connect(settings.postgres_dsn))
+        resolver = stack.enter_context(connect_kb_api(settings))
+        embedders = stack.enter_context(providers(settings.embedding_timeout))
 
         consumer = Consumer(
             url=settings.pubsub_url,
-            handler=IndexingHandler(store),
+            handler=IndexingHandler(
+                store,
+                Cached(resolver, settings.embedding_cache_ttl),
+                embedders,
+            ),
             stopping=stopping,
             policy=Policy(
                 retries=settings.consumer_retries,
