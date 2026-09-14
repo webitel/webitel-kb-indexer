@@ -19,6 +19,20 @@ uv run kb-indexer config   # effective configuration, credentials masked
 uv run kb-indexer run
 ```
 
+## Metrics
+
+Exported over OTLP when `OTEL_METRICS_EXPORTER` names an exporter, `otlpgrpc`
+or `otlphttp`, to the standard `OTEL_EXPORTER_OTLP_*`
+endpoint, under the names of the design document.
+
+| Metric | Kind | Attributes | Meaning |
+|---|---|---|---|
+| `kb_reindex_lag_seconds` | histogram | `embedded` | from the edit of an article to the version being searchable |
+| `kb_reindex_queue_depth` | gauge | | jobs waiting in `kb.reindex` |
+| `kb_reindex_dlq_depth` | gauge | | jobs in `kb.reindex.dlq`, waiting for attention |
+| `kb_reindex_failed_total` | counter | `reason` | jobs that ended in the dead letter queue |
+| `kb_embedding_duration_seconds` | histogram | `provider`, `model`, `outcome` | one call to an embedding provider |
+
 ## Generated code
 Regenerate with:
 

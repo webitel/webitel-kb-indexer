@@ -3,6 +3,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from types import SimpleNamespace
 
 import pika
 import pytest
@@ -10,6 +11,7 @@ from pika.exceptions import AMQPConnectionError
 
 from kb_indexer import consumer, topology
 from kb_indexer.handler import PermanentError, TransientError
+from tests.conftest import Recorded
 
 URL = "amqp://webitel:secret@rabbit:5672/"
 
@@ -36,6 +38,13 @@ class Properties:
         self.headers = headers
 
 
+class Declared:
+    """The answer of the broker to a queue declaration."""
+
+    def __init__(self, message_count):
+        self.method = SimpleNamespace(message_count=message_count)
+
+
 class FakeChannel:
     def __init__(self):
         self.is_open = True
@@ -44,12 +53,21 @@ class FakeChannel:
         self.acked = []
         self.nacked = []
         self.declared = []
+        self.depths = {topology.REINDEX_QUEUE: 0, topology.REINDEX_DLQ: 0}
+        self.probed = 0
 
     def exchange_declare(self, exchange, **arguments):
         self.declared.append(exchange)
 
-    def queue_declare(self, queue, **arguments):
+    def queue_declare(self, queue, passive=False, **arguments):
+        if passive:
+            self.probed += 1
+
+            return Declared(self.depths[queue])
+
         self.declared.append(queue)
+
+        return Declared(0)
 
     def queue_bind(self, queue, exchange, **arguments):
         self.declared.append((queue, exchange))
@@ -149,9 +167,10 @@ class Pipeline:
 
 
 class Harness:
-    def __init__(self, monkeypatch, handler, policy=None, connections=1):
+    def __init__(self, monkeypatch, handler, policy=None, connections=1, probe=60.0):
         monkeypatch.setattr(consumer, "RECONNECT_DELAY", 0.01)
         monkeypatch.setattr(consumer, "RECONNECT_DELAY_MAX", 0.01)
+        monkeypatch.setattr(consumer, "DEPTH_PROBE", probe)
 
         self.connections = [FakeConnection() for _ in range(connections)]
         self.attempts = 0
@@ -169,7 +188,8 @@ class Harness:
         monkeypatch.setattr(pika, "BlockingConnection", dial)
 
         self.stopping = threading.Event()
-        self.consumer = consumer.Consumer(URL, handler, self.stopping, policy)
+        self.recorded = Recorded()
+        self.consumer = consumer.Consumer(URL, handler, self.stopping, policy, self.recorded.metrics)
         self.thread = threading.Thread(target=self.consumer.run, daemon=True)
 
     def __enter__(self):
@@ -181,9 +201,19 @@ class Harness:
     def __exit__(self, *failure):
         self.stopping.set()
         self.thread.join(5)
+        self.recorded.close()
         assert not self.thread.is_alive(), "the consumer did not stop"
 
         return False
+
+    def failed(self):
+        return {attributes["reason"]: count for attributes, count in self.recorded.points("kb_reindex_failed_total")}
+
+    def depth(self):
+        queue = self.recorded.points("kb_reindex_queue_depth")
+        dlq = self.recorded.points("kb_reindex_dlq_depth")
+
+        return (queue[0][1], dlq[0][1]) if queue and dlq else None
 
     @property
     def channel(self):
@@ -248,6 +278,7 @@ def test_an_envelope_the_worker_cannot_act_on_goes_to_the_dead_letter_queue(monk
         assert harness.channel.nacked == [(3, False)]
         assert pipeline.handled == []
         assert pipeline.given_up == []
+        assert harness.failed() == {"envelope": 1}
 
 
 def test_a_transient_failure_is_retried_and_then_given_up_on(monkeypatch, brisk):
@@ -260,6 +291,7 @@ def test_a_transient_failure_is_retried_and_then_given_up_on(monkeypatch, brisk)
         assert len(pipeline.handled) == brisk.retries + 1
         assert len(pipeline.given_up) == 1
         assert harness.channel.nacked == [(5, False)]
+        assert harness.failed() == {"exhausted": 1}
 
 
 def test_a_transient_failure_that_clears_is_acknowledged(monkeypatch, brisk):
@@ -274,8 +306,11 @@ def test_a_transient_failure_that_clears_is_acknowledged(monkeypatch, brisk):
         assert harness.channel.nacked == []
 
 
-@pytest.mark.parametrize("failure", [PermanentError("malformed body"), ValueError("a bug")])
-def test_a_failure_that_is_not_transient_is_not_retried(monkeypatch, brisk, failure):
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [(PermanentError("malformed body"), "permanent"), (ValueError("a bug"), "unexpected")],
+)
+def test_a_failure_that_is_not_transient_is_not_retried(monkeypatch, brisk, failure, reason):
     pipeline = Pipeline(outcomes=[failure])
 
     with Harness(monkeypatch, pipeline, brisk) as harness:
@@ -285,6 +320,7 @@ def test_a_failure_that_is_not_transient_is_not_retried(monkeypatch, brisk, fail
         assert len(pipeline.handled) == 1
         assert len(pipeline.given_up) == 1
         assert harness.channel.nacked == [(9, False)]
+        assert harness.failed() == {reason: 1}
 
 
 def test_a_failure_that_cannot_be_recorded_returns_the_delivery(monkeypatch, brisk):
@@ -298,6 +334,7 @@ def test_a_failure_that_cannot_be_recorded_returns_the_delivery(monkeypatch, bri
 
         assert harness.channel.nacked == []
         assert harness.channel.acked == []
+        assert harness.failed() == {}
 
 
 def test_a_shutdown_during_a_retry_returns_the_delivery(monkeypatch):
@@ -412,6 +449,42 @@ def test_a_broker_that_cannot_be_reached_is_retried(monkeypatch, brisk):
         harness.thread.join(5)
 
     assert not harness.thread.is_alive()
+
+
+def test_the_depth_of_the_queues_is_read_over_the_consuming_connection(monkeypatch, brisk):
+    pipeline = Pipeline()
+
+    with Harness(monkeypatch, pipeline, brisk, probe=0.05) as harness:
+        declared = list(harness.channel.declared)
+        harness.channel.depths = {topology.REINDEX_QUEUE: 5, topology.REINDEX_DLQ: 2}
+        wait_for(lambda: harness.depth() == (5, 2))
+
+        assert harness.channel.probed >= 2
+        assert harness.channel.declared == declared
+
+
+def test_a_shutdown_during_a_retry_returns_the_delivery_and_counts_no_failure(monkeypatch):
+    policy = consumer.Policy(retries=5, retry_backoff=0.05, shutdown_timeout=2.0)
+    pipeline = Pipeline(outcomes=[TransientError("timeout")] * 10)
+
+    with Harness(monkeypatch, pipeline, policy) as harness:
+        harness.connections[0].deliver(tag=13)
+        wait_for(lambda: len(pipeline.handled) == 1)
+        harness.stopping.set()
+        wait_for(lambda: not harness.connections[0].is_open)
+
+        assert harness.failed() == {}
+
+
+def test_the_depth_does_not_outlive_the_session(monkeypatch, brisk):
+    pipeline = Pipeline()
+
+    with Harness(monkeypatch, pipeline, brisk) as harness:
+        wait_for(lambda: harness.depth() == (0, 0))
+
+    # A worker that lost its broker stops reporting rather than freezing at
+    # its last reading.
+    assert harness.depth() is None
 
 
 @pytest.mark.parametrize(

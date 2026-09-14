@@ -11,6 +11,7 @@ from kb_indexer.handler import PermanentError, TransientError
 from kb_indexer.indexing import IndexingHandler
 from kb_indexer.resolver import SpaceEmbedding
 from kb_indexer.store import Job
+from tests.conftest import Recorded
 
 EVENT = ArticleReindex(
     occurred_at=datetime(2026, 7, 27, 10, 30, tzinfo=UTC),
@@ -143,6 +144,7 @@ class Pipeline:
 
     def __init__(self, **built):
         self.journal: list[tuple[Any, ...]] = []
+        self.recorded = built.get("recorded") or Recorded()
         self.store = FakeStore(
             self.journal,
             job=built.get("job", JOB),
@@ -159,6 +161,7 @@ class Pipeline:
             self.store,
             self.resolver,
             FakeProviders(self.journal, self.embedder, failure=built.get("unsupported")),
+            self.recorded.metrics,
             policy=built.get("policy", chunking.DEFAULT),
         )
 
@@ -361,6 +364,63 @@ def test_a_late_job_finishes_without_moving_the_pointer(caplog):
 
     assert pipeline.entry("publish") == ("publish", 3, 7, 2)
     assert caplog.records[-1].published is False
+
+
+def test_the_lag_is_recorded_from_the_edit_once_the_version_is_published():
+    pipeline = Pipeline()
+
+    pipeline.handle()
+
+    [(attributes, count)] = pipeline.recorded.points("kb_reindex_lag_seconds")
+    assert (attributes, count) == ({"embedded": True}, 1)
+
+
+def test_a_space_without_vector_search_reports_its_lag_apart():
+    pipeline = Pipeline(model=None)
+
+    pipeline.handle()
+
+    assert pipeline.recorded.points("kb_reindex_lag_seconds") == [({"embedded": False}, 1)]
+
+
+@pytest.mark.parametrize(
+    "built",
+    [
+        {"published": False},
+        {"job": None},
+        {"job": replace(JOB, article_deleted=True)},
+    ],
+    ids=["late job", "version gone", "article deleted"],
+)
+def test_a_job_that_made_nothing_searchable_has_no_lag(built):
+    pipeline = Pipeline(**built)
+
+    pipeline.handle()
+
+    assert pipeline.recorded.points("kb_reindex_lag_seconds") == []
+
+
+def test_every_call_to_the_provider_is_timed_under_its_model():
+    long_body = "\n\n".join(f"## Розділ {number}\n\nТекст розділу." for number in range(6))
+    pipeline = Pipeline(job=replace(JOB, body_markdown=long_body), batch=2)
+
+    pipeline.handle()
+
+    assert len(pipeline.entries("embed")) == 3
+    assert pipeline.recorded.points("kb_embedding_duration_seconds") == [
+        ({"provider": "e5", "model": "multilingual-e5-large", "outcome": "ok"}, 3),
+    ]
+
+
+def test_a_call_the_provider_refused_is_timed_as_an_error():
+    pipeline = Pipeline(failure=TransientError("the provider returned status 503"))
+
+    with pytest.raises(TransientError):
+        pipeline.handle()
+
+    assert pipeline.recorded.points("kb_embedding_duration_seconds") == [
+        ({"provider": "e5", "model": "multilingual-e5-large", "outcome": "error"}, 1),
+    ]
 
 
 def test_giving_up_marks_the_article_failed():
