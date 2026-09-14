@@ -39,8 +39,8 @@ class Storage(Protocol):
         """Which of the chunks already carry a vector of the model."""
         ...
 
-    def write_embeddings(self, model_id: int, vectors: list[tuple[int, list[float]]]) -> None:
-        """Store the vectors of chunks under the model."""
+    def write_embeddings(self, job: Job, model_id: int, vectors: list[tuple[int, list[float]]]) -> None:
+        """Store the vectors of the chunks of a job under the model."""
         ...
 
     def publish(self, article_id: int, version_id: int, version_number: int) -> bool:
@@ -147,6 +147,7 @@ class IndexingHandler:
 
             # After every batch, so a failure halfway keeps what it paid for.
             self._store.write_embeddings(
+                job,
                 model.model_id,
                 [(chunk_id, vector) for (chunk_id, _content), vector in zip(batch, vectors, strict=True)],
             )

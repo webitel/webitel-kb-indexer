@@ -30,6 +30,7 @@ JOB_SQL = """
 SELECT v.id AS version_id,
        v.article_id,
        a.space_id,
+       s.domain_id,
        v.version_number,
        v.subject,
        v.body_markdown,
@@ -113,10 +114,11 @@ SELECT chunk_id FROM kb.chunk_embedding
 WHERE model_id = %(model_id)s AND chunk_id = ANY(%(chunk_ids)s)
 """
 
-# One vector per chunk and model: a repeat replaces it.
+# One vector per chunk and model: a repeat replaces it. The scope rides on the
+# row so a filtered search needs no join before it ranks.
 WRITE_EMBEDDING_SQL = """
-INSERT INTO kb.chunk_embedding (chunk_id, model_id, embedding)
-VALUES (%(chunk_id)s, %(model_id)s, %(embedding)s::vector)
+INSERT INTO kb.chunk_embedding (chunk_id, model_id, domain_id, space_id, embedding)
+VALUES (%(chunk_id)s, %(model_id)s, %(domain_id)s, %(space_id)s, %(embedding)s::vector)
 ON CONFLICT (chunk_id, model_id) DO UPDATE
 SET embedding = EXCLUDED.embedding, created_at = now()
 """
@@ -129,6 +131,7 @@ class Job:
     version_id: int
     article_id: int
     space_id: int
+    domain_id: int
     version_number: int
     subject: str
     body_markdown: str
@@ -198,10 +201,16 @@ class Store:
 
         return {chunk_id for (chunk_id,) in found}
 
-    def write_embeddings(self, model_id: int, vectors: list[tuple[int, list[float]]]) -> None:
-        """Store the vectors of chunks under the model."""
+    def write_embeddings(self, job: Job, model_id: int, vectors: list[tuple[int, list[float]]]) -> None:
+        """Store the vectors of the chunks of a job under the model."""
         rows = [
-            {"chunk_id": chunk_id, "model_id": model_id, "embedding": vector_literal(vector)}
+            {
+                "chunk_id": chunk_id,
+                "model_id": model_id,
+                "domain_id": job.domain_id,
+                "space_id": job.space_id,
+                "embedding": vector_literal(vector),
+            }
             for chunk_id, vector in vectors
         ]
 
