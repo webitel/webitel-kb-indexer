@@ -2,15 +2,27 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import pika
+from dotenv import dotenv_values
 from psycopg import conninfo
 from pydantic import Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LOG_LEVELS = frozenset({"debug", "info", "warn", "warning", "error"})
+
+# OpenTelemetry exporters.
+OTLP_GRPC = "otlpgrpc"
+OTLP_HTTP = "otlphttp"
+EXPORTER_NONE = "none"
+EXPORTERS = frozenset({OTLP_GRPC, OTLP_HTTP, EXPORTER_NONE})
+
+# Variables the OpenTelemetry exporters read from the environment themselves.
+SDK_PREFIX = "OTEL_"
 
 DEFAULT_ENV_FILE = ".env"
 
@@ -67,6 +79,11 @@ class Settings(BaseSettings):
     log_file: str = ""
     log_otel: bool = False
 
+    # Where the telemetry goes. Unset is off; the address and the rest come from
+    # the standard OTEL_EXPORTER_OTLP_* variables the exporters read themselves.
+    otel_metrics_exporter: str = ""
+    otel_logs_exporter: str = ""
+
     @field_validator("postgres_dsn")
     @classmethod
     def _usable_database_dsn(cls, value: str) -> str:
@@ -121,6 +138,16 @@ class Settings(BaseSettings):
 
         return level
 
+    @field_validator("otel_metrics_exporter", "otel_logs_exporter")
+    @classmethod
+    def _known_exporter(cls, value: str) -> str:
+        exporter = value.strip().lower()
+        if exporter and exporter not in EXPORTERS:
+            msg = f"unknown exporter {value!r}, expected one of {', '.join(sorted(EXPORTERS))}"
+            raise ValueError(msg)
+
+        return exporter
+
     def require(self) -> None:
         """Fail on values the worker cannot run without."""
         missing = [name.upper() for name in REQUIRED if not str(getattr(self, name)).strip()]
@@ -141,8 +168,19 @@ def load(env_file: str | None = DEFAULT_ENV_FILE) -> Settings:
         raise ConfigError(_readable(exc)) from exc
 
     settings.require()
+    _export_sdk_variables(env_file)
 
     return settings
+
+
+def _export_sdk_variables(env_file: str | None) -> None:
+    """Hand the OTEL_* lines of the env file to the exporters, which read only the environment."""
+    if env_file is None or not Path(env_file).is_file():
+        return
+
+    for name, value in dotenv_values(env_file).items():
+        if name.upper().startswith(SDK_PREFIX) and value is not None:
+            os.environ.setdefault(name, value)
 
 
 def _shown(name: str, value: Any) -> Any:

@@ -1,3 +1,4 @@
+import os
 import pathlib
 
 import pytest
@@ -59,6 +60,56 @@ def test_an_invalid_value_is_reported_under_its_variable_name(complete_env):
     complete_env.setenv("LOG_LEVEL", "chatty")
 
     with pytest.raises(config.ConfigError, match="LOG_LEVEL"):
+        config.load(env_file=None)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", ""),
+        ("otlpgrpc", "otlpgrpc"),
+        (" OTLPHTTP ", "otlphttp"),
+        ("none", "none"),
+    ],
+)
+def test_the_exporter_is_read_under_the_name_the_go_services_use(complete_env, value, expected):
+    complete_env.setenv("OTEL_METRICS_EXPORTER", value)
+    complete_env.setenv("OTEL_LOGS_EXPORTER", value)
+
+    settings = config.load(env_file=None)
+
+    assert (settings.otel_metrics_exporter, settings.otel_logs_exporter) == (expected, expected)
+
+
+def test_the_exporter_variables_of_the_env_file_reach_the_exporters(complete_env, tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "OTEL_METRICS_EXPORTER=otlpgrpc\n"
+        "OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4317\n"
+        "OTEL_EXPORTER_OTLP_HEADERS=from-the-file\n"
+        "LOG_LEVEL=debug\n",
+    )
+    for name in ("OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_HEADERS"):
+        complete_env.setenv(name, "")
+        complete_env.delenv(name)
+    complete_env.setenv("OTEL_EXPORTER_OTLP_HEADERS", "from-the-environment")
+
+    settings = config.load(env_file=str(env_file))
+
+    assert settings.otel_metrics_exporter == "otlpgrpc"
+    assert os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://collector:4317"
+    assert os.environ["OTEL_EXPORTER_OTLP_HEADERS"] == "from-the-environment"
+    # Settings of the worker itself stay in the settings.
+    assert settings.log_level == "debug"
+    assert os.environ.get("LOG_LEVEL") is None
+
+
+@pytest.mark.parametrize("variable", ["OTEL_METRICS_EXPORTER", "OTEL_LOGS_EXPORTER"])
+def test_an_exporter_the_worker_does_not_have_is_a_configuration_error(complete_env, variable):
+    # A typo must stop the start, not leave the process silently unobserved.
+    complete_env.setenv(variable, "prometheus")
+
+    with pytest.raises(config.ConfigError, match=variable):
         config.load(env_file=None)
 
 

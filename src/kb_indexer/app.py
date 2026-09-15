@@ -7,11 +7,14 @@ import signal
 import threading
 from contextlib import ExitStack
 
+from opentelemetry import metrics as otel
+
 from kb_indexer import SERVICE_NAME, SERVICE_VERSION
 from kb_indexer.config import Settings
 from kb_indexer.consumer import Consumer, Policy
 from kb_indexer.embedding import providers
 from kb_indexer.indexing import IndexingHandler
+from kb_indexer.metrics import Metrics
 from kb_indexer.resolver import Cached
 from kb_indexer.resolver import connect as connect_kb_api
 from kb_indexer.store import connect
@@ -31,7 +34,16 @@ def run(settings: Settings) -> int:
     _install_signals(stopping)
 
     with ExitStack() as stack:
-        stack.enter_context(telemetry(SERVICE_NAME, SERVICE_VERSION, export_logs=settings.log_otel))
+        stack.enter_context(
+            telemetry(
+                SERVICE_NAME,
+                SERVICE_VERSION,
+                metrics_exporter=settings.otel_metrics_exporter,
+                logs_exporter=settings.otel_logs_exporter,
+                export_logs=settings.log_otel,
+            ),
+        )
+        metrics = Metrics(otel.get_meter(SERVICE_NAME, SERVICE_VERSION))
         store = stack.enter_context(connect(settings.postgres_dsn))
         resolver = stack.enter_context(connect_kb_api(settings))
         embedders = stack.enter_context(providers(settings.embedding_timeout))
@@ -42,6 +54,7 @@ def run(settings: Settings) -> int:
                 store,
                 Cached(resolver, settings.embedding_cache_ttl),
                 embedders,
+                metrics,
             ),
             stopping=stopping,
             policy=Policy(
@@ -49,6 +62,7 @@ def run(settings: Settings) -> int:
                 retry_backoff=settings.consumer_retry_backoff,
                 shutdown_timeout=settings.consumer_shutdown_timeout,
             ),
+            metrics=metrics,
         )
 
         log.info("indexer started", extra={"version": SERVICE_VERSION})

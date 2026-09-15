@@ -15,7 +15,8 @@ from pika.exceptions import AMQPError
 
 from kb_indexer import topology
 from kb_indexer.events import ArticleReindex, EnvelopeError, parse
-from kb_indexer.handler import Handler, TransientError
+from kb_indexer.handler import Handler, PermanentError, TransientError
+from kb_indexer.metrics import REASON_ENVELOPE, REASON_EXHAUSTED, REASON_PERMANENT, REASON_UNEXPECTED, Metrics
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,10 @@ RETRY_DELAY_MAX = 30.0
 
 # How long one turn of the shutdown waits for the delivery in flight.
 DRAIN_TICK = 0.2
+
+# How often the depth of the queues is read. The broker answers it from its
+# own state, so nothing between two readings is missed, only delayed.
+DEPTH_PROBE = 15.0
 
 
 class Settlement(Enum):
@@ -89,11 +94,13 @@ class Consumer:
         handler: Handler,
         stopping: threading.Event,
         policy: Policy,
+        metrics: Metrics,
     ) -> None:
         self._parameters = pika.URLParameters(url)
         self._handler = handler
         self._stopping = stopping
         self._policy = policy
+        self._metrics = metrics
         self._session: _Session | None = None
 
     def run(self) -> None:
@@ -133,15 +140,27 @@ class Consumer:
             channel.basic_consume(topology.REINDEX_QUEUE, on_message_callback=self._deliver)
             log.info("consuming", extra={"queue": topology.REINDEX_QUEUE, "prefetch": topology.PREFETCH})
 
+            probed = float("-inf")
             while not self._stopping.is_set() and connection.is_open:
+                if time.monotonic() - probed >= DEPTH_PROBE:
+                    self._probe(channel)
+                    probed = time.monotonic()
+
                 connection.process_data_events(time_limit=TICK)
 
             self._drain(session)
         finally:
             self._session = None
+            self._metrics.forget_depth()
             _close(connection)
 
         return time.monotonic() - started
+
+    def _probe(self, channel: Any) -> None:
+        """Read how deep the queues are. Runs on the connection thread."""
+        queue = channel.queue_declare(topology.REINDEX_QUEUE, passive=True).method.message_count
+        dlq = channel.queue_declare(topology.REINDEX_DLQ, passive=True).method.message_count
+        self._metrics.depth(queue, dlq)
 
     def _deliver(self, _channel: Any, method: Any, properties: Any, body: bytes) -> None:
         """Hand the delivery to a worker thread. Runs on the connection thread."""
@@ -177,6 +196,7 @@ class Consumer:
         except EnvelopeError as broken:
             # Nothing identifies the article, so nothing can be marked failed.
             log.error("envelope rejected", extra={"reason": str(broken), "message_id": message_id(properties)})
+            self._metrics.failed(REASON_ENVELOPE)
 
             return Settlement.DEAD_LETTER
 
@@ -199,6 +219,8 @@ class Consumer:
             log.exception("the failure could not be recorded", extra=event.as_fields())
 
             return Settlement.REDELIVER
+
+        self._metrics.failed(_reason(failure))
 
         return Settlement.DEAD_LETTER
 
@@ -270,6 +292,17 @@ class Consumer:
         if session.connection.is_open:
             # The settlement is queued on the connection thread; let it out.
             session.connection.process_data_events(time_limit=DRAIN_TICK)
+
+
+def _reason(failure: Exception) -> str:
+    """The label of a failure, by how it was classified."""
+    if isinstance(failure, TransientError):
+        return REASON_EXHAUSTED
+
+    if isinstance(failure, PermanentError):
+        return REASON_PERMANENT
+
+    return REASON_UNEXPECTED
 
 
 def message_id(properties: Any) -> str:

@@ -8,6 +8,7 @@ import pytest
 
 from kb_indexer import app, config
 from kb_indexer.indexing import IndexingHandler
+from kb_indexer.metrics import Metrics
 from kb_indexer.resolver import Cached
 
 
@@ -73,11 +74,12 @@ class FakeConsumer:
 
     made: ClassVar[list["FakeConsumer"]] = []
 
-    def __init__(self, url, handler, stopping, policy):
+    def __init__(self, url, handler, stopping, policy, metrics):
         self.url = url
         self.handler = handler
         self.stopping = stopping
         self.policy = policy
+        self.metrics = metrics
         FakeConsumer.made.append(self)
 
     def run(self):
@@ -96,7 +98,7 @@ def test_the_components_are_left_before_the_process_returns(settings, consumer, 
     journal = []
 
     @contextmanager
-    def fake_telemetry(name, version, *, export_logs):
+    def fake_telemetry(name, version, *, metrics_exporter, logs_exporter, export_logs):
         journal.append("enter")
         try:
             yield
@@ -108,6 +110,24 @@ def test_the_components_are_left_before_the_process_returns(settings, consumer, 
 
     assert app.run(settings) == 0
     assert journal == ["enter", "leave"]
+
+
+def test_telemetry_is_given_the_configured_exporters(complete_env, consumer, monkeypatch):
+    complete_env.setenv("OTEL_METRICS_EXPORTER", "otlpgrpc")
+    complete_env.setenv("OTEL_LOGS_EXPORTER", "otlphttp")
+    complete_env.setenv("LOG_OTEL", "true")
+    given = {}
+
+    @contextmanager
+    def fake_telemetry(name, version, **exporters):
+        given.update(exporters)
+        yield
+
+    monkeypatch.setattr(app, "telemetry", fake_telemetry)
+    threading.Timer(0.2, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+
+    assert app.run(config.load(env_file=None)) == 0
+    assert given == {"metrics_exporter": "otlpgrpc", "logs_exporter": "otlphttp", "export_logs": True}
 
 
 def test_the_consumer_is_given_the_configured_broker_and_policy(complete_env, consumer, monkeypatch):
@@ -135,6 +155,8 @@ def test_the_pipeline_is_given_the_configured_database(settings, consumer, datab
     built = consumer.made[-1]
     assert isinstance(built.handler, IndexingHandler)
     assert database[-1].dsn == settings.postgres_dsn
+    assert isinstance(built.metrics, Metrics)
+    assert built.handler._metrics is built.metrics
 
 
 def test_the_pipeline_is_given_the_configured_kb_api(settings, consumer, kb_api, monkeypatch):

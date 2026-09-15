@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Iterator
 from typing import Protocol
 
@@ -10,6 +11,7 @@ from kb_indexer import chunking
 from kb_indexer.embedding import CredentialRefusedError, Embedder
 from kb_indexer.events import ArticleReindex
 from kb_indexer.handler import PermanentError
+from kb_indexer.metrics import Metrics
 from kb_indexer.resolver import SpaceEmbedding
 from kb_indexer.store import Job
 
@@ -76,11 +78,13 @@ class IndexingHandler:
         store: Storage,
         resolver: Resolving,
         providers: Providing,
+        metrics: Metrics,
         policy: chunking.Policy = chunking.DEFAULT,
     ) -> None:
         self._store = store
         self._resolver = resolver
         self._providers = providers
+        self._metrics = metrics
         self._policy = policy
 
     def handle(self, event: ArticleReindex) -> None:
@@ -102,6 +106,8 @@ class IndexingHandler:
         embedded = 0 if model is None or embedder is None else self._embed(job, model, embedder, written, chunks)
         published = self._store.publish(job.article_id, job.version_id, job.version_number)
 
+        lag = self._metrics.indexed(event.occurred_at, embedded=model is not None) if published else None
+
         log.info(
             "article indexed",
             extra={
@@ -110,6 +116,7 @@ class IndexingHandler:
                 "embedded": embedded,
                 "model_id": 0 if model is None else model.model_id,
                 "published": published,
+                "lag": lag,
             },
         )
 
@@ -137,7 +144,7 @@ class IndexingHandler:
         written = 0
         for batch in _batched(pending, embedder.batch):
             try:
-                vectors = embedder.embed(model, [content for _chunk_id, content in batch])
+                vectors = self._call(model, embedder, [content for _chunk_id, content in batch])
             except CredentialRefusedError:
                 # The stored credential changed under us: ask kb-api again
                 # rather than wait the cache out.
@@ -154,6 +161,18 @@ class IndexingHandler:
             written += len(batch)
 
         return written
+
+    def _call(self, model: SpaceEmbedding, embedder: Embedder, texts: list[str]) -> list[list[float]]:
+        """One timed call to the provider; a refusal costs time too."""
+        started = time.monotonic()
+        ok = False
+        try:
+            vectors = embedder.embed(model, texts)
+            ok = True
+        finally:
+            self._metrics.embedding(model.provider, model.model_ref, time.monotonic() - started, ok=ok)
+
+        return vectors
 
     def _accept(self, event: ArticleReindex, job: Job) -> None:
         """Refuse a job no attempt of this worker can complete."""
