@@ -15,8 +15,8 @@ implements that document and ships no migration of its own.
 ```sh
 uv sync
 cp .env.example .env
-uv run kb-indexer config   # effective configuration, credentials masked
-uv run kb-indexer run
+uv run webitel-kb-indexer config   # effective configuration, credentials masked
+uv run webitel-kb-indexer run
 ```
 
 ## Metrics
