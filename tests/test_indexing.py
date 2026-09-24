@@ -371,8 +371,8 @@ def test_the_lag_is_recorded_from_the_edit_once_the_version_is_published():
 
     pipeline.handle()
 
-    [(attributes, count)] = pipeline.recorded.points("kb_reindex_lag_seconds")
-    assert (attributes, count) == ({"embedded": True}, 1)
+    [(attributes, count)] = pipeline.recorded.points("webitel.kb.article.index.duration")
+    assert (attributes, count) == ({"webitel.kb.article.index.embedded": True}, 1)
 
 
 def test_a_space_without_vector_search_reports_its_lag_apart():
@@ -380,7 +380,8 @@ def test_a_space_without_vector_search_reports_its_lag_apart():
 
     pipeline.handle()
 
-    assert pipeline.recorded.points("kb_reindex_lag_seconds") == [({"embedded": False}, 1)]
+    points = pipeline.recorded.points("webitel.kb.article.index.duration")
+    assert points == [({"webitel.kb.article.index.embedded": False}, 1)]
 
 
 @pytest.mark.parametrize(
@@ -397,7 +398,14 @@ def test_a_job_that_made_nothing_searchable_has_no_lag(built):
 
     pipeline.handle()
 
-    assert pipeline.recorded.points("kb_reindex_lag_seconds") == []
+    assert pipeline.recorded.points("webitel.kb.article.index.duration") == []
+
+
+EMBEDDINGS = {
+    "gen_ai.operation.name": "embeddings",
+    "gen_ai.provider.name": "e5",
+    "gen_ai.request.model": "multilingual-e5-large",
+}
 
 
 def test_every_call_to_the_provider_is_timed_under_its_model():
@@ -407,8 +415,8 @@ def test_every_call_to_the_provider_is_timed_under_its_model():
     pipeline.handle()
 
     assert len(pipeline.entries("embed")) == 3
-    assert pipeline.recorded.points("kb_embedding_duration_seconds") == [
-        ({"provider": "e5", "model": "multilingual-e5-large", "outcome": "ok"}, 3),
+    assert pipeline.recorded.points("gen_ai.client.operation.duration") == [
+        ({**EMBEDDINGS}, 3),
     ]
 
 
@@ -418,8 +426,8 @@ def test_a_call_the_provider_refused_is_timed_as_an_error():
     with pytest.raises(TransientError):
         pipeline.handle()
 
-    assert pipeline.recorded.points("kb_embedding_duration_seconds") == [
-        ({"provider": "e5", "model": "multilingual-e5-large", "outcome": "error"}, 1),
+    assert pipeline.recorded.points("gen_ai.client.operation.duration") == [
+        ({**EMBEDDINGS, "error.type": "TransientError"}, 1),
     ]
 
 

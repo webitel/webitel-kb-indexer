@@ -22,16 +22,10 @@ uv run webitel-kb-indexer run
 ## Metrics
 
 Exported over OTLP when `OTEL_METRICS_EXPORTER` names an exporter, `otlpgrpc`
-or `otlphttp`, to the standard `OTEL_EXPORTER_OTLP_*`
-endpoint, under the names of the design document.
+or `otlphttp`, to the standard `OTEL_EXPORTER_OTLP_*` endpoint.
 
-| Metric | Kind | Attributes | Meaning |
-|---|---|---|---|
-| `kb_reindex_lag_seconds` | histogram | `embedded` | from the edit of an article to the version being searchable |
-| `kb_reindex_queue_depth` | gauge | | jobs waiting in `kb.reindex` |
-| `kb_reindex_dlq_depth` | gauge | | jobs in `kb.reindex.dlq`, waiting for attention |
-| `kb_reindex_failed_total` | counter | `reason` | jobs that ended in the dead letter queue |
-| `kb_embedding_duration_seconds` | histogram | `provider`, `model`, `outcome` | one call to an embedding provider |
+Defined in the Webitel semantic conventions:
+[docs/webitel/metrics.md](https://github.com/webitel/opentelemetry-semantic-conventions/blob/main/docs/webitel/metrics.md).
 
 ## Generated code
 Regenerate with:

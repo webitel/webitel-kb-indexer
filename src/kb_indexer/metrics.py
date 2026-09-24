@@ -15,13 +15,36 @@ REASON_PERMANENT = "permanent"
 REASON_EXHAUSTED = "exhausted"
 REASON_UNEXPECTED = "unexpected"
 
-OUTCOME_OK = "ok"
-OUTCOME_ERROR = "error"
+# Names follow the Webitel semantic conventions of webitel-go-kit: dotted, under
+# the webitel namespace, the unit kept out of the name. What OpenTelemetry
+# already defines is taken from it instead.
+INDEX_DURATION = "webitel.kb.article.index.duration"
+INDEX_JOB_COUNT = "webitel.kb.article.index.job.count"
+INDEX_JOB_FAILED = "webitel.kb.article.index.job.failed"
+ATTR_EMBEDDED = "webitel.kb.article.index.embedded"
+ATTR_ERROR_TYPE = "error.type"
+
+# The index state kb-api reports articles under: a job waiting in the indexing
+# queue is `pending`, one in its dead letter queue is `failed`.
+ATTR_INDEX_STATE = "webitel.kb.article.index.state"
+STATE_PENDING = "pending"
+STATE_FAILED = "failed"
+
+# One provider call, under the GenAI semantic conventions of OpenTelemetry.
+GEN_AI_OPERATION_DURATION = "gen_ai.client.operation.duration"
+ATTR_GEN_AI_OPERATION = "gen_ai.operation.name"
+ATTR_GEN_AI_PROVIDER = "gen_ai.provider.name"
+ATTR_GEN_AI_MODEL = "gen_ai.request.model"
+GEN_AI_EMBEDDINGS = "embeddings"
+
+# Providers the GenAI conventions have a name for; the rest are self-hosted and
+# are reported under the name kb-api registers them with.
+GEN_AI_PROVIDERS = {"gemini": "gcp.gemini"}
 
 LAG_BUCKETS: Sequence[float] = (0.5, 1, 2, 5, 10, 15, 20, 30, 45, 60, 120, 300, 600, 1800)
 
-# One provider call, up to the timeout it is given.
-EMBEDDING_BUCKETS: Sequence[float] = (0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30)
+# The boundaries the GenAI conventions ask for: from 10 ms, doubling up to 81.92 s.
+EMBEDDING_BUCKETS: Sequence[float] = tuple(0.01 * 2**power for power in range(14))
 
 
 class Metrics:
@@ -29,38 +52,34 @@ class Metrics:
 
     The depth of the queues is observed, not set: with nothing observed the
     gauge is absent from the export, so a worker that lost its broker stops
-    reporting rather than freezing at its last reading.
+    reporting rather than freezing at its last reading. It is a gauge, not an
+    up-down counter: every worker reads the same broker queues, so summing
+    the readings of several workers would count one queue several times.
     """
 
     def __init__(self, meter: Meter) -> None:
         self._lag = meter.create_histogram(
-            "kb_reindex_lag_seconds",
+            INDEX_DURATION,
             unit="s",
             description="Time from the edit of an article to the version being searchable",
             explicit_bucket_boundaries_advisory=LAG_BUCKETS,
         )
         self._embedding = meter.create_histogram(
-            "kb_embedding_duration_seconds",
+            GEN_AI_OPERATION_DURATION,
             unit="s",
-            description="Duration of one embedding call to a provider",
+            description="GenAI operation duration.",
             explicit_bucket_boundaries_advisory=EMBEDDING_BUCKETS,
         )
         self._failed = meter.create_counter(
-            "kb_reindex_failed_total",
+            INDEX_JOB_FAILED,
             unit="{job}",
             description="Jobs that ended in the dead letter queue",
         )
         meter.create_observable_gauge(
-            "kb_reindex_queue_depth",
-            callbacks=[self._observe_queue],
-            unit="{message}",
-            description="Jobs waiting in the indexing queue",
-        )
-        meter.create_observable_gauge(
-            "kb_reindex_dlq_depth",
-            callbacks=[self._observe_dlq],
-            unit="{message}",
-            description="Jobs in the dead letter queue, waiting for attention",
+            INDEX_JOB_COUNT,
+            callbacks=[self._observe_depth],
+            unit="{job}",
+            description="Jobs waiting in the indexing queue and in its dead letter queue",
         )
 
         self._guard = threading.Lock()
@@ -74,18 +93,25 @@ class Metrics:
         """
         moment = datetime.now(UTC) if now is None else now
         lag = max((moment - occurred_at).total_seconds(), 0.0)
-        self._lag.record(lag, {"embedded": embedded})
+        self._lag.record(lag, {ATTR_EMBEDDED: embedded})
 
         return lag
 
-    def embedding(self, provider: str, model: str, seconds: float, *, ok: bool) -> None:
+    def embedding(self, provider: str, model: str, seconds: float, *, error_type: str | None = None) -> None:
         """Record one call to a provider, whether or not it answered."""
-        outcome = OUTCOME_OK if ok else OUTCOME_ERROR
-        self._embedding.record(seconds, {"provider": provider, "model": model, "outcome": outcome})
+        attributes = {
+            ATTR_GEN_AI_OPERATION: GEN_AI_EMBEDDINGS,
+            ATTR_GEN_AI_PROVIDER: GEN_AI_PROVIDERS.get(provider, provider),
+            ATTR_GEN_AI_MODEL: model,
+        }
+        if error_type is not None:
+            attributes[ATTR_ERROR_TYPE] = error_type
+
+        self._embedding.record(seconds, attributes)
 
     def failed(self, reason: str) -> None:
         """Count a job that ended in the dead letter queue."""
-        self._failed.add(1, {"reason": reason})
+        self._failed.add(1, {ATTR_ERROR_TYPE: reason})
 
     def depth(self, queue: int, dlq: int) -> None:
         """Remember the latest reading of the queues."""
@@ -97,17 +123,16 @@ class Metrics:
         with self._guard:
             self._depth = None
 
-    def _observe_queue(self, _options: CallbackOptions) -> Iterable[Observation]:
-        return self._observed(0)
-
-    def _observe_dlq(self, _options: CallbackOptions) -> Iterable[Observation]:
-        return self._observed(1)
-
-    def _observed(self, position: int) -> list[Observation]:
+    def _observe_depth(self, _options: CallbackOptions) -> Iterable[Observation]:
         with self._guard:
             depth = self._depth
 
         if depth is None:
             return []
 
-        return [Observation(depth[position])]
+        queue, dlq = depth
+
+        return [
+            Observation(queue, {ATTR_INDEX_STATE: STATE_PENDING}),
+            Observation(dlq, {ATTR_INDEX_STATE: STATE_FAILED}),
+        ]
