@@ -14,8 +14,8 @@ EXIT_CONFIG = 2
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Entry point of the `kb-indexer` command."""
-    parser = argparse.ArgumentParser(prog="kb-indexer", description="Webitel Knowledge Base indexer")
+    """Entry point of the `webitel-kb-indexer` command."""
+    parser = argparse.ArgumentParser(prog="webitel-kb-indexer", description="Webitel Knowledge Base indexer")
     parser.add_argument("--version", action="version", version=f"{SERVICE_NAME} {SERVICE_VERSION}")
 
     commands = parser.add_subparsers(dest="command", required=True)

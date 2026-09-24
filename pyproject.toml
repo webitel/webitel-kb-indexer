@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.scripts]
-kb-indexer = "kb_indexer.cli:main"
+webitel-kb-indexer = "kb_indexer.cli:main"
 
 [dependency-groups]
 dev = [
