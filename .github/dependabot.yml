@@ -1,0 +1,23 @@
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+    ignore:
+      - dependency-name: "webitel/reusable-workflows"
+      - dependency-name: "webitel/reusable-workflows/*"
+
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+    allow: [ dependency-type: "direct" ]
+    open-pull-requests-limit: 5
+    labels: [ "dependencies", "python" ]
+    commit-message:
+      include: scope
+      prefix: "chore"
