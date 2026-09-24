@@ -8,37 +8,27 @@ from datetime import UTC, datetime
 
 from opentelemetry.metrics import CallbackOptions, Meter, Observation
 
-# Why a delivery ended in the dead letter queue. A closed set: the label must
-# not grow with the text of the failures.
 REASON_ENVELOPE = "envelope"
 REASON_PERMANENT = "permanent"
 REASON_EXHAUSTED = "exhausted"
 REASON_UNEXPECTED = "unexpected"
 
-# Names follow the Webitel semantic conventions of webitel-go-kit: dotted, under
-# the webitel namespace, the unit kept out of the name. What OpenTelemetry
-# already defines is taken from it instead.
 INDEX_DURATION = "webitel.kb.article.index.duration"
 INDEX_JOB_COUNT = "webitel.kb.article.index.job.count"
 INDEX_JOB_FAILED = "webitel.kb.article.index.job.failed"
 ATTR_EMBEDDED = "webitel.kb.article.index.embedded"
 ATTR_ERROR_TYPE = "error.type"
 
-# The index state kb-api reports articles under: a job waiting in the indexing
-# queue is `pending`, one in its dead letter queue is `failed`.
 ATTR_INDEX_STATE = "webitel.kb.article.index.state"
 STATE_PENDING = "pending"
 STATE_FAILED = "failed"
 
-# One provider call, under the GenAI semantic conventions of OpenTelemetry.
 GEN_AI_OPERATION_DURATION = "gen_ai.client.operation.duration"
 ATTR_GEN_AI_OPERATION = "gen_ai.operation.name"
 ATTR_GEN_AI_PROVIDER = "gen_ai.provider.name"
 ATTR_GEN_AI_MODEL = "gen_ai.request.model"
 GEN_AI_EMBEDDINGS = "embeddings"
 
-# Providers the GenAI conventions have a name for; the rest are self-hosted and
-# are reported under the name kb-api registers them with.
 GEN_AI_PROVIDERS = {"gemini": "gcp.gemini"}
 
 LAG_BUCKETS: Sequence[float] = (0.5, 1, 2, 5, 10, 15, 20, 30, 45, 60, 120, 300, 600, 1800)
