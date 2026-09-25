@@ -207,13 +207,15 @@ class Harness:
         return False
 
     def failed(self):
-        return {attributes["reason"]: count for attributes, count in self.recorded.points("kb_reindex_failed_total")}
+        failed = self.recorded.points("webitel.kb.article.index.job.failed")
+
+        return {attributes["error.type"]: count for attributes, count in failed}
 
     def depth(self):
-        queue = self.recorded.points("kb_reindex_queue_depth")
-        dlq = self.recorded.points("kb_reindex_dlq_depth")
+        points = self.recorded.points("webitel.kb.article.index.job.count")
+        count = {attributes["webitel.kb.article.index.state"]: value for attributes, value in points}
 
-        return (queue[0][1], dlq[0][1]) if queue and dlq else None
+        return (count["pending"], count["failed"]) if count else None
 
     @property
     def channel(self):

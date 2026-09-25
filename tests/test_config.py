@@ -198,6 +198,7 @@ def test_the_service_token_is_never_described(complete_env):
 
 def test_every_setting_is_in_the_example_environment():
     example = pathlib.Path(".env.example").read_text()
-    missing = [name.upper() for name in config.Settings.model_fields if name.upper() not in example]
+    settings = [name.upper() for name in config.Settings.model_fields]
+    missing = [name for name in settings if not name.startswith(config.SDK_PREFIX) and name not in example]
 
     assert missing == []

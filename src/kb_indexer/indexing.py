@@ -165,14 +165,14 @@ class IndexingHandler:
     def _call(self, model: SpaceEmbedding, embedder: Embedder, texts: list[str]) -> list[list[float]]:
         """One timed call to the provider; a refusal costs time too."""
         started = time.monotonic()
-        ok = False
+        error_type = None
         try:
-            vectors = embedder.embed(model, texts)
-            ok = True
+            return embedder.embed(model, texts)
+        except BaseException as failure:
+            error_type = type(failure).__name__
+            raise
         finally:
-            self._metrics.embedding(model.provider, model.model_ref, time.monotonic() - started, ok=ok)
-
-        return vectors
+            self._metrics.embedding(model.provider, model.model_ref, time.monotonic() - started, error_type=error_type)
 
     def _accept(self, event: ArticleReindex, job: Job) -> None:
         """Refuse a job no attempt of this worker can complete."""
