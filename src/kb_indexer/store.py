@@ -57,12 +57,20 @@ WHERE e.chunk_id = c.id
 """
 
 # The chunk keeps its id across a repeat, so the vectors of unchanged chunks
-# survive it.
+# survive it. The lexical vector follows the configuration of the space.
 WRITE_CHUNKS_SQL = """
-INSERT INTO kb.chunk (version_id, chunk_index, content)
-SELECT %(version_id)s, incoming.position - 1, incoming.content
+INSERT INTO kb.chunk (version_id, chunk_index, content, tsv)
+SELECT %(version_id)s, incoming.position - 1, incoming.content,
+       to_tsvector(config.text_search_config::regconfig, incoming.content)
 FROM unnest(%(contents)s::text[]) WITH ORDINALITY AS incoming(content, position)
-ON CONFLICT (version_id, chunk_index) DO UPDATE SET content = EXCLUDED.content
+CROSS JOIN (
+    SELECT s.text_search_config
+    FROM kb.article_version v
+    JOIN kb.article a ON a.id = v.article_id
+    JOIN kb.space s ON s.id = a.space_id
+    WHERE v.id = %(version_id)s
+) config
+ON CONFLICT (version_id, chunk_index) DO UPDATE SET content = EXCLUDED.content, tsv = EXCLUDED.tsv
 RETURNING id, chunk_index
 """
 
