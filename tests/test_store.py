@@ -160,6 +160,18 @@ def test_chunks_are_written_without_duplicating_what_is_there():
     assert tail[1] == {"version_id": 7, "count": 2}
 
 
+def test_chunks_carry_a_lexical_vector_under_the_space_configuration():
+    store, cursor = build(results=[[], [(11, 0)], []])
+
+    store.write_chunks(7, ["оплата картой"])
+
+    _stale, upsert, _tail = cursor.calls
+    assert "INSERT INTO kb.chunk (version_id, chunk_index, content, tsv)" in upsert[0]
+    assert "to_tsvector(config.text_search_config::regconfig, incoming.content)" in upsert[0]
+    assert "JOIN kb.space s ON s.id = a.space_id WHERE v.id = %(version_id)s" in upsert[0]
+    assert "DO UPDATE SET content = EXCLUDED.content, tsv = EXCLUDED.tsv" in upsert[0]
+
+
 def test_a_body_that_yields_nothing_leaves_no_chunks_behind():
     store, cursor = build()
 
