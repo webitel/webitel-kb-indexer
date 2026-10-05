@@ -4,7 +4,7 @@ version: 1
 source:
   repository: webitel/reusable-configs
   config: python/sync.yml
-  sha: 7cbd4e6072e30e64da55427fa7fb1ef23c246fdc
+  sha: ef4e42032ca6d3cd02a819e6978ed645e2e227b3
 files:
   .editorconfig:
     source: python/configs/.editorconfig
@@ -26,7 +26,7 @@ files:
     sha256: 3f9a2526900d4505d509e45ee406c6cccfaaca7e1661f7919863019e74fdcdc2
   .github/workflows/pull-request-deliver.yml:
     source: common/workflows/pull-request-deliver.yml.njk
-    sha256: 7b09034525817980276d58b737b635e553cc53af86d610b1f739531d01c73dc1
+    sha256: 32cb0cc31bddbe87f8ab48c358e72a57f64769cc4b765c2d2cc5f8048feb8517
   .github/workflows/pull-request.yml:
     source: python/workflows/pull-request.yml.njk
     sha256: 47314fa378e8c737a8e05b510d8d9a989dd14b2307c511009765242372aae9e8
@@ -35,7 +35,7 @@ files:
     sha256: 72dcf66a77e60068d4b98441f1ed44fbb2b9e03879c856544345e14a7ad495d2
   .github/workflows/workflow.yml:
     source: python/workflows/workflow.yml.njk
-    sha256: 5ea807fbc1ed88f4cccd2659d33295c8f5e0c66773409a45e31f4228df17e042
+    sha256: e7faadb58eeefba003167d5d5f07bf54b6b89e49d45e50f145d32d990e1bc4f2
   .gitignore:
     source: python/configs/.gitignore
     sha256: d1cd45a1ef24f25362075968ae01c913443a25f013889b8ae633c2ce93dec2d2
