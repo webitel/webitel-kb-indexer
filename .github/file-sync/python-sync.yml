@@ -4,7 +4,7 @@ version: 1
 source:
   repository: webitel/reusable-configs
   config: python/sync.yml
-  sha: ef4e42032ca6d3cd02a819e6978ed645e2e227b3
+  sha: c6b7f6611fd2df35b7671c0e14a56d77355110d7
 files:
   .editorconfig:
     source: python/configs/.editorconfig
@@ -41,7 +41,7 @@ files:
     sha256: d1cd45a1ef24f25362075968ae01c913443a25f013889b8ae633c2ce93dec2d2
   deploy/debian/postinst.sh:
     source: common/deploy/debian/postinst.sh
-    sha256: 16ed996e66be0fc485962df0cdcba6f6b236b31642da569fbaff4e41b2e397c3
+    sha256: 64d78b2c2285ea52a26e63445854f2ae6bee585aa3ab9fb246537bddfb5b353f
   deploy/debian/postrm.sh:
     source: common/deploy/debian/postrm.sh
     sha256: a4f55d995a6e71c5b98518bd95236d9f90475508470e147a669baa9116a5d855
