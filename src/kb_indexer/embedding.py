@@ -18,6 +18,8 @@ log = logging.getLogger(__name__)
 
 PROVIDER_GEMINI = "gemini"
 PROVIDER_OPENAI = "openai"
+PROVIDER_COHERE = "cohere"
+PROVIDER_AZURE = "azure"
 PROVIDER_E5 = "e5"
 
 # Providers served by one local service over the OpenAI embeddings contract.
@@ -25,10 +27,14 @@ ENDPOINT_PROVIDERS = frozenset({"bge-m3", PROVIDER_E5, "byom"})
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com"
 OPENAI_BASE_URL = "https://api.openai.com"
+COHERE_BASE_URL = "https://api.cohere.com/v2"
 
 # The embeddings route of the OpenAI API, also served by TEI, llama.cpp server,
 # vLLM and Ollama.
 OPENAI_ROUTE = "v1/embeddings"
+
+# The same route under the root of an Azure OpenAI resource.
+AZURE_ROUTE = "openai/v1/embeddings"
 
 # e5 reads the task from the text: documents carry this prefix, queries
 # (embedded by kb-api) carry "query: ".
@@ -41,11 +47,18 @@ GEMINI_NATIVE_DIMENSIONS = 3072
 # is usually a single box with one accelerator.
 GEMINI_BATCH = 100
 OPENAI_BATCH = 100
+AZURE_BATCH = 100
+COHERE_BATCH = 96
 ENDPOINT_BATCH = 32
 
 # Documents are stored and searched; queries are embedded at retrieval time,
 # by kb-api, and never here.
 GEMINI_TASK = "RETRIEVAL_DOCUMENT"
+COHERE_INPUT_TYPE = "search_document"
+
+# gemini-embedding-2 ignores taskType and reads the task from this prefix.
+GEMINI_PROMPTED_MODEL = "models/gemini-embedding-2"
+GEMINI_DOCUMENT_PREFIX = "title: none | text: "
 
 # How much of a refusal is kept for the log.
 MAX_ERROR_BODY = 2048
@@ -85,11 +98,17 @@ class Gemini:
     def embed(self, model: SpaceEmbedding, texts: list[str]) -> list[list[float]]:
         """One vector per text, in the order the texts were given."""
         path = _model_path(model.model_ref)
-        common: dict[str, Any] = {"model": path, "taskType": GEMINI_TASK}
+        common: dict[str, Any] = {"model": path}
+        prefix = ""
+        if path.startswith(GEMINI_PROMPTED_MODEL):
+            prefix = GEMINI_DOCUMENT_PREFIX
+        else:
+            common["taskType"] = GEMINI_TASK
+
         if model.dimensions > 0:
             common["outputDimensionality"] = model.dimensions
 
-        body = {"requests": [{**common, "content": {"parts": [{"text": text}]}} for text in texts]}
+        body = {"requests": [{**common, "content": {"parts": [{"text": prefix + text}]}} for text in texts]}
         url = f"{self._base_url}/v1beta/{path}:batchEmbedContents"
         payload = _posted(self._client, url, body, {"x-goog-api-key": model.api_key})
 
@@ -144,6 +163,68 @@ class OpenAI:
         return _checked(vectors, len(texts), model.dimensions)
 
 
+class Azure:
+    """An Azure OpenAI resource over its v1 API; the model is the deployment name."""
+
+    batch = AZURE_BATCH
+
+    def __init__(self, client: httpx.Client) -> None:
+        self._client = client
+
+    def embed(self, model: SpaceEmbedding, texts: list[str]) -> list[list[float]]:
+        """One vector per text, in the order the texts were given, shortened to the model's size."""
+        if not model.endpoint:
+            msg = f"model {model.model_ref!r} is an azure deployment but carries no resource url"
+            raise PermanentError(msg)
+
+        body: dict[str, Any] = {"model": model.model_ref, "input": texts}
+        if model.dimensions > 0:
+            body["dimensions"] = model.dimensions
+        vectors = _openai_embedded(self._client, model.endpoint, {"api-key": model.api_key}, body, AZURE_ROUTE)
+
+        return _checked(vectors, len(texts), model.dimensions)
+
+
+class Cohere:
+    """Cohere embeddings."""
+
+    batch = COHERE_BATCH
+
+    def __init__(self, client: httpx.Client, base_url: str = COHERE_BASE_URL) -> None:
+        self._client = client
+        self._base_url = base_url.rstrip("/")
+
+    def embed(self, model: SpaceEmbedding, texts: list[str]) -> list[list[float]]:
+        """One vector per text, in the order the texts were given.
+
+        The size is asked for only from the models that take one (embed-v4 and
+        newer); the older ones have a fixed size.
+        """
+        if not texts:
+            return []
+
+        body: dict[str, Any] = {
+            "model": model.model_ref,
+            "texts": texts,
+            "input_type": COHERE_INPUT_TYPE,
+            "embedding_types": ["float"],
+        }
+        if model.dimensions > 0 and model.model_ref.startswith("embed-v"):
+            body["output_dimension"] = model.dimensions
+
+        headers = {"Authorization": f"Bearer {model.api_key}"}
+        payload = _posted(self._client, f"{self._base_url}/embed", body, headers)
+
+        embeddings = payload.get("embeddings")
+        if not isinstance(embeddings, dict):
+            msg = "the provider answered without an embeddings object"
+            raise PermanentError(msg)
+
+        vectors = [_numbers(vector) for vector in _listed(embeddings, "float")]
+
+        return _checked(vectors, len(texts), model.dimensions)
+
+
 class Providers:
     """The providers this worker can call, over one client."""
 
@@ -157,6 +238,12 @@ class Providers:
 
         if provider == PROVIDER_OPENAI:
             return OpenAI(self._client)
+
+        if provider == PROVIDER_AZURE:
+            return Azure(self._client)
+
+        if provider == PROVIDER_COHERE:
+            return Cohere(self._client)
 
         if provider == PROVIDER_E5:
             return Endpoint(self._client, E5_DOCUMENT_PREFIX)
@@ -205,12 +292,13 @@ def _openai_embedded(
     root: str,
     headers: dict[str, str],
     body: dict[str, Any],
+    route: str = OPENAI_ROUTE,
 ) -> list[list[float]]:
-    """Vectorize the body's input over the OpenAI embeddings contract, in input order."""
+    """Vectorize the body's input over the OpenAI embeddings contract at the route of root, in input order."""
     if not body["input"]:
         return []
 
-    payload = _posted(client, _service_url(root, OPENAI_ROUTE), body, headers)
+    payload = _posted(client, _service_url(root, route), body, headers)
 
     return _by_index(_listed(payload, "data"), len(body["input"]))
 
