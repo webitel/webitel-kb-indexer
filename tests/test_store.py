@@ -192,15 +192,17 @@ def test_the_chunks_that_already_carry_a_vector_are_named():
     assert "WHERE model_id = %(model_id)s AND chunk_id = ANY(%(chunk_ids)s)" in sql
 
 
-def test_a_vector_replaces_the_one_the_chunk_carried():
+@pytest.mark.parametrize("dimensions", [768, 1024])
+def test_a_vector_replaces_the_one_the_chunk_carried_in_the_column_of_its_size(dimensions):
     store, cursor = build()
 
-    store.write_embeddings(JOB, 4, [(11, [1.0, 0.0]), (12, [0.0, 1.0])])
+    store.write_embeddings(JOB, 4, dimensions, [(11, [1.0, 0.0]), (12, [0.0, 1.0])])
 
+    column = f"embedding_{dimensions}"
     sql, rows = cursor.calls[0]
-    assert "INSERT INTO kb.chunk_embedding (chunk_id, model_id, domain_id, space_id, embedding)" in sql
+    assert f"INSERT INTO kb.chunk_embedding (chunk_id, model_id, domain_id, space_id, {column})" in sql
     assert "%(embedding)s::vector" in sql
-    assert "ON CONFLICT (chunk_id, model_id) DO UPDATE" in sql
+    assert f"ON CONFLICT (chunk_id, model_id) DO UPDATE SET {column} = EXCLUDED.{column}" in sql
     assert rows == [
         {"chunk_id": 11, "model_id": 4, "domain_id": 1, "space_id": 5, "embedding": "[1.0,0.0]"},
         {"chunk_id": 12, "model_id": 4, "domain_id": 1, "space_id": 5, "embedding": "[0.0,1.0]"},
@@ -211,7 +213,7 @@ def test_the_vectors_of_one_job_are_written_in_one_transaction():
     pool = FakePool(FakeCursor([]))
     store = Store(cast(ConnectionPool[Connection[TupleRow]], pool))
 
-    store.write_embeddings(JOB, 4, [(11, [1.0]), (12, [0.0])])
+    store.write_embeddings(JOB, 4, 768, [(11, [1.0]), (12, [0.0])])
 
     assert pool.connection_calls == 1
 

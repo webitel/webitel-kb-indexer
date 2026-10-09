@@ -123,13 +123,19 @@ WHERE model_id = %(model_id)s AND chunk_id = ANY(%(chunk_ids)s)
 """
 
 # One vector per chunk and model: a repeat replaces it. The scope rides on the
-# row so a filtered search needs no join before it ranks.
-WRITE_EMBEDDING_SQL = """
-INSERT INTO kb.chunk_embedding (chunk_id, model_id, domain_id, space_id, embedding)
+# row so a filtered search needs no join before it ranks. Every vector size has
+# its own column, embedding_<dimensions>, named by write_embedding_sql.
+_WRITE_EMBEDDING_SQL = """
+INSERT INTO kb.chunk_embedding (chunk_id, model_id, domain_id, space_id, {column})
 VALUES (%(chunk_id)s, %(model_id)s, %(domain_id)s, %(space_id)s, %(embedding)s::vector)
 ON CONFLICT (chunk_id, model_id) DO UPDATE
-SET embedding = EXCLUDED.embedding, created_at = now()
+SET {column} = EXCLUDED.{column}, created_at = now()
 """
+
+
+def write_embedding_sql(dimensions: int) -> str:
+    """The vector write into the column of the size; the name is built from an integer only."""
+    return _WRITE_EMBEDDING_SQL.format(column=f"embedding_{int(dimensions)}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,8 +215,14 @@ class Store:
 
         return {chunk_id for (chunk_id,) in found}
 
-    def write_embeddings(self, job: Job, model_id: int, vectors: list[tuple[int, list[float]]]) -> None:
-        """Store the vectors of the chunks of a job under the model."""
+    def write_embeddings(
+        self,
+        job: Job,
+        model_id: int,
+        dimensions: int,
+        vectors: list[tuple[int, list[float]]],
+    ) -> None:
+        """Store the vectors of the chunks of a job under the model, in the column of its size."""
         rows = [
             {
                 "chunk_id": chunk_id,
@@ -223,7 +235,7 @@ class Store:
         ]
 
         with self._connection() as connection, connection.cursor() as cursor:
-            cursor.executemany(WRITE_EMBEDDING_SQL, rows)
+            cursor.executemany(write_embedding_sql(dimensions), rows)
 
     def _mark(self, article_id: int, state: int) -> None:
         with self._connection() as connection, connection.cursor() as cursor:

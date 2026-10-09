@@ -7,6 +7,7 @@ import math
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -16,11 +17,22 @@ from kb_indexer.resolver import SpaceEmbedding
 log = logging.getLogger(__name__)
 
 PROVIDER_GEMINI = "gemini"
+PROVIDER_OPENAI = "openai"
+PROVIDER_E5 = "e5"
 
-# Providers served by one local service over the canonical contract.
-ENDPOINT_PROVIDERS = frozenset({"bge-m3", "e5", "byom"})
+# Providers served by one local service over the OpenAI embeddings contract.
+ENDPOINT_PROVIDERS = frozenset({"bge-m3", PROVIDER_E5, "byom"})
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com"
+OPENAI_BASE_URL = "https://api.openai.com"
+
+# The embeddings route of the OpenAI API, also served by TEI, llama.cpp server,
+# vLLM and Ollama.
+OPENAI_ROUTE = "v1/embeddings"
+
+# e5 reads the task from the text: documents carry this prefix, queries
+# (embedded by kb-api) carry "query: ".
+E5_DOCUMENT_PREFIX = "passage: "
 
 # Gemini unit-normalizes only its native output; a shorter vector is ours to scale.
 GEMINI_NATIVE_DIMENSIONS = 3072
@@ -28,12 +40,12 @@ GEMINI_NATIVE_DIMENSIONS = 3072
 # How many texts one call carries. The self-hosted batch is the smaller one: it
 # is usually a single box with one accelerator.
 GEMINI_BATCH = 100
+OPENAI_BATCH = 100
 ENDPOINT_BATCH = 32
 
 # Documents are stored and searched; queries are embedded at retrieval time,
 # by kb-api, and never here.
 GEMINI_TASK = "RETRIEVAL_DOCUMENT"
-ENDPOINT_TASK = "document"
 
 # How much of a refusal is kept for the log.
 MAX_ERROR_BODY = 2048
@@ -89,29 +101,45 @@ class Gemini:
 
 
 class Endpoint:
-    """A self-hosted service serving the canonical `/embed` contract."""
+    """A self-hosted service serving the OpenAI embeddings contract."""
 
     batch = ENDPOINT_BATCH
 
-    def __init__(self, client: httpx.Client) -> None:
+    def __init__(self, client: httpx.Client, document_prefix: str = "") -> None:
         self._client = client
+        self._prefix = document_prefix
 
     def embed(self, model: SpaceEmbedding, texts: list[str]) -> list[list[float]]:
-        """One vector per text, in the order the texts were given."""
+        """One vector per text, in the order the texts were given.
+
+        The server takes the size from the model itself, so none is asked for.
+        """
         if not model.endpoint:
             msg = f"model {model.model_ref!r} is self-hosted but carries no endpoint url"
             raise PermanentError(msg)
 
-        body = {
-            "model": model.model_ref,
-            "texts": texts,
-            "dimensions": model.dimensions,
-            "task": ENDPOINT_TASK,
-        }
-        url = f"{model.endpoint.rstrip('/')}/embed"
-        payload = _posted(self._client, url, body, {})
+        body = {"model": model.model_ref, "input": [self._prefix + text for text in texts]}
+        vectors = _openai_embedded(self._client, model.endpoint, {}, body)
 
-        vectors = [_numbers(item) for item in _listed(payload, "embeddings")]
+        return _checked(vectors, len(texts), model.dimensions)
+
+
+class OpenAI:
+    """OpenAI embeddings."""
+
+    batch = OPENAI_BATCH
+
+    def __init__(self, client: httpx.Client, base_url: str = OPENAI_BASE_URL) -> None:
+        self._client = client
+        self._base_url = base_url
+
+    def embed(self, model: SpaceEmbedding, texts: list[str]) -> list[list[float]]:
+        """One vector per text, in the order the texts were given, shortened to the model's size."""
+        headers = {"Authorization": f"Bearer {model.api_key}"}
+        body: dict[str, Any] = {"model": model.model_ref, "input": texts}
+        if model.dimensions > 0:
+            body["dimensions"] = model.dimensions
+        vectors = _openai_embedded(self._client, self._base_url, headers, body)
 
         return _checked(vectors, len(texts), model.dimensions)
 
@@ -127,6 +155,12 @@ class Providers:
         if provider == PROVIDER_GEMINI:
             return Gemini(self._client)
 
+        if provider == PROVIDER_OPENAI:
+            return OpenAI(self._client)
+
+        if provider == PROVIDER_E5:
+            return Endpoint(self._client, E5_DOCUMENT_PREFIX)
+
         if provider in ENDPOINT_PROVIDERS:
             return Endpoint(self._client)
 
@@ -140,6 +174,67 @@ def providers(timeout: float) -> Iterator[Providers]:
     with httpx.Client(timeout=timeout) as client:
         log.info("embedding clients ready", extra={"timeout": timeout})
         yield Providers(client)
+
+
+def _service_url(root: str, route: str) -> str:
+    """Join the root of a service and a route on the URL path.
+
+    A root registered with the route, or a leading part of it, already on its
+    path names the same route.
+    """
+    try:
+        parts = urlsplit(root)
+    except ValueError as broken:
+        msg = f"the endpoint of the registration is not a url: {broken}"
+        raise PermanentError(msg) from broken
+
+    path = parts.path.rstrip("/")
+    steps = route.split("/")
+
+    for n in range(len(steps), 0, -1):
+        lead = "/" + "/".join(steps[:n])
+        if path.endswith(lead):
+            path = path.removesuffix(lead)
+            break
+
+    return urlunsplit(parts._replace(path=f"{path}/{route}"))
+
+
+def _openai_embedded(
+    client: httpx.Client,
+    root: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+) -> list[list[float]]:
+    """Vectorize the body's input over the OpenAI embeddings contract, in input order."""
+    if not body["input"]:
+        return []
+
+    payload = _posted(client, _service_url(root, OPENAI_ROUTE), body, headers)
+
+    return _by_index(_listed(payload, "data"), len(body["input"]))
+
+
+def _by_index(items: list[Any], inputs: int) -> list[list[float]]:
+    """The vectors put back in input order; each input must be answered exactly once."""
+    if len(items) != inputs:
+        msg = f"the provider answered {len(items)} of {inputs} inputs"
+        raise PermanentError(msg)
+
+    vectors: list[list[float] | None] = [None] * inputs
+    for item in items:
+        index = item.get("index") if isinstance(item, dict) else None
+        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < inputs:
+            msg = f"the provider answered an unknown input {index!r}"
+            raise PermanentError(msg)
+
+        if vectors[index] is not None:
+            msg = f"the provider answered input {index} twice"
+            raise PermanentError(msg)
+
+        vectors[index] = _numbers(item.get("embedding"))
+
+    return [vector for vector in vectors if vector is not None]
 
 
 def _posted(
