@@ -71,8 +71,8 @@ class FakeStore:
 
         return set(self._stored)
 
-    def write_embeddings(self, job, model_id, vectors):
-        self.calls.append(("write_embeddings", job, model_id, vectors))
+    def write_embeddings(self, job, model_id, dimensions, vectors):
+        self.calls.append(("write_embeddings", job, model_id, dimensions, vectors))
 
     def publish(self, article_id, version_id, version_number):
         self.calls.append(("publish", article_id, version_id, version_number))
@@ -234,8 +234,8 @@ def test_the_vectors_are_stored_against_the_chunks_they_describe():
     pipeline.handle()
 
     _step, _version_id, contents = pipeline.entry("write_chunks")
-    _step, job, model_id, vectors = pipeline.entry("write_embeddings")
-    assert (job.domain_id, job.space_id, model_id) == (1, 5, 4)
+    _step, job, model_id, dimensions, vectors = pipeline.entry("write_embeddings")
+    assert (job.domain_id, job.space_id, model_id, dimensions) == (1, 5, 4, 3)
     assert [chunk_id for chunk_id, _vector in vectors] == [100 + index for index in range(len(contents))]
     assert [vector[0] for _chunk_id, vector in vectors] == [float(len(content)) for content in contents]
     assert pipeline.entry("for_provider") == ("for_provider", "e5")

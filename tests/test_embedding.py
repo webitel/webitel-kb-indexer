@@ -5,11 +5,18 @@ import httpx
 import pytest
 
 from kb_indexer.embedding import (
+    AZURE_BATCH,
+    COHERE_BATCH,
+    E5_DOCUMENT_PREFIX,
     ENDPOINT_BATCH,
     GEMINI_BATCH,
+    OPENAI_BATCH,
+    Azure,
+    Cohere,
     CredentialRefusedError,
     Endpoint,
     Gemini,
+    OpenAI,
     Providers,
     providers,
 )
@@ -52,6 +59,22 @@ class Recorded:
         return httpx.Response(self._status, content=body, headers={"content-type": "application/json"})
 
 
+OPENAI = SpaceEmbedding(
+    model_id=6,
+    provider="openai",
+    model_ref="text-embedding-3-small",
+    dimensions=3,
+    endpoint="http://elsewhere.local",
+    validated=True,
+    api_key="s3cr3t",
+)
+
+
+def data(*vectors):
+    """An OpenAI embeddings answer, listed last input first so the order must come from the index."""
+    return {"data": [{"index": i, "embedding": v} for i, v in reversed(list(enumerate(vectors)))]}
+
+
 def client(handler):
     return httpx.Client(transport=httpx.MockTransport(handler), timeout=1)
 
@@ -76,6 +99,18 @@ def test_gemini_is_called_the_way_kb_api_validates_a_model():
     assert body["requests"][0]["taskType"] == "RETRIEVAL_DOCUMENT"
     assert body["requests"][0]["outputDimensionality"] == 3
     assert body["requests"][0]["model"] == "models/gemini-embedding-001"
+
+
+@pytest.mark.parametrize("model_ref", ["gemini-embedding-2", "models/gemini-embedding-2-preview"])
+def test_gemini_2_reads_the_task_from_the_prefix_of_a_document(model_ref):
+    handler = Recorded({"embeddings": [{"values": [1.0, 0.0, 0.0]}]})
+    model = SpaceEmbedding(4, "gemini", model_ref, 3, "", True, "s3cr3t")
+
+    Gemini(client(handler)).embed(model, ["текст"])
+
+    request = sent(handler)["requests"][0]
+    assert "taskType" not in request
+    assert request["content"]["parts"][0]["text"] == "title: none | text: текст"
 
 
 def test_a_model_ref_that_already_names_the_path_is_left_alone():
@@ -111,19 +146,101 @@ def test_a_zero_vector_survives_the_scaling():
     assert Gemini(client(handler)).embed(CLOUD, ["текст"]) == [[0.0, 0.0, 0.0]]
 
 
-def test_the_self_hosted_service_is_called_over_the_canonical_contract():
-    handler = Recorded({"embeddings": [[1.0, 0.0, 0.0]]})
+@pytest.mark.parametrize(
+    "endpoint",
+    ["http://embed.local", "http://embed.local/", "http://embed.local/v1", "http://embed.local/v1/embeddings"],
+)
+def test_the_self_hosted_service_is_called_over_the_openai_contract(endpoint):
+    model = SpaceEmbedding(5, "bge-m3", "BAAI/bge-m3", 3, endpoint, True, "")
+    handler = Recorded(data([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]))
 
-    vectors = Endpoint(client(handler)).embed(SELF_HOSTED, ["текст"])
+    vectors = Endpoint(client(handler)).embed(model, ["перше", "друге"])
 
+    assert vectors == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    assert str(handler.requests[0].url) == "http://embed.local/v1/embeddings"
+    assert "authorization" not in handler.requests[0].headers
+    assert sent(handler) == {"model": "BAAI/bge-m3", "input": ["перше", "друге"]}
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "url"),
+    [
+        ("http://v1", "http://v1/v1/embeddings"),
+        ("http://embeddings:8080", "http://embeddings:8080/v1/embeddings"),
+        ("http://gw.local/xv1", "http://gw.local/xv1/v1/embeddings"),
+        ("http://gw.local/models/e5/", "http://gw.local/models/e5/v1/embeddings"),
+    ],
+)
+def test_only_the_path_of_the_endpoint_is_read_for_the_route(endpoint, url):
+    model = SpaceEmbedding(5, "bge-m3", "BAAI/bge-m3", 3, endpoint, True, "")
+    handler = Recorded(data([1.0, 0.0, 0.0]))
+
+    Endpoint(client(handler)).embed(model, ["текст"])
+
+    assert str(handler.requests[0].url) == url
+
+
+def test_nothing_to_embed_costs_no_call():
+    handler = Recorded(data())
+
+    assert Endpoint(client(handler)).embed(SELF_HOSTED, []) == []
+    assert OpenAI(client(handler)).embed(OPENAI, []) == []
+    assert handler.requests == []
+
+
+def test_e5_reads_the_task_from_the_prefix_of_a_document():
+    handler = Recorded(data([1.0, 0.0, 0.0]))
+
+    Providers(client(handler)).for_provider("e5").embed(SELF_HOSTED, ["текст"])
+
+    assert sent(handler)["input"] == [E5_DOCUMENT_PREFIX + "текст"]
+    assert E5_DOCUMENT_PREFIX == "passage: "
+
+
+@pytest.mark.parametrize("provider", ["bge-m3", "byom"])
+def test_other_self_hosted_models_take_the_text_as_is(provider):
+    handler = Recorded(data([1.0, 0.0, 0.0]))
+
+    Providers(client(handler)).for_provider(provider).embed(SELF_HOSTED, ["текст"])
+
+    assert sent(handler)["input"] == ["текст"]
+
+
+def test_openai_is_called_at_its_own_api_with_the_key_and_the_size():
+    handler = Recorded(data([1.0, 0.0, 0.0]))
+
+    vectors = OpenAI(client(handler)).embed(OPENAI, ["текст"])
+
+    request = handler.requests[0]
     assert vectors == [[1.0, 0.0, 0.0]]
-    assert str(handler.requests[0].url) == "http://embed.local/embed"
-    assert sent(handler) == {
-        "model": "multilingual-e5-large",
-        "texts": ["текст"],
-        "dimensions": 3,
-        "task": "document",
-    }
+    assert str(request.url) == "https://api.openai.com/v1/embeddings"
+    assert request.headers["authorization"] == "Bearer s3cr3t"
+    assert sent(handler) == {"model": "text-embedding-3-small", "input": ["текст"], "dimensions": 3}
+
+
+def test_openai_is_asked_for_no_size_the_model_does_not_declare():
+    handler = Recorded(data([1.0, 0.0, 0.0]))
+    model = SpaceEmbedding(6, "openai", "text-embedding-3-small", 0, "", True, "s3cr3t")
+
+    with pytest.raises(PermanentError, match="expected 0"):
+        OpenAI(client(handler)).embed(model, ["текст"])
+
+    assert "dimensions" not in sent(handler)
+
+
+@pytest.mark.parametrize(("status", "expected"), [(400, PermanentError), (429, TransientError), (500, TransientError)])
+def test_an_openai_refusal_says_whether_another_attempt_is_worth_making(status, expected):
+    handler = Recorded({"error": {"message": "no"}}, status=status)
+
+    with pytest.raises(expected, match=str(status)):
+        OpenAI(client(handler)).embed(OPENAI, ["текст"])
+
+
+def test_openai_refusing_the_key_is_worth_asking_for_it_again():
+    handler = Recorded({"error": {"message": "Incorrect API key provided"}}, status=401)
+
+    with pytest.raises(CredentialRefusedError, match="401"):
+        OpenAI(client(handler)).embed(OPENAI, ["текст"])
 
 
 def test_an_endpoint_this_client_cannot_speak_to_is_refused_for_good():
@@ -138,7 +255,7 @@ def test_an_endpoint_this_client_cannot_speak_to_is_refused_for_good():
 
 def test_a_self_hosted_model_without_an_endpoint_cannot_be_served():
     model = SpaceEmbedding(5, "e5", "multilingual-e5-large", 3, "", True, "")
-    handler = Recorded({"embeddings": []})
+    handler = Recorded(data())
 
     with pytest.raises(PermanentError, match="no endpoint url"):
         Endpoint(client(handler)).embed(model, ["текст"])
@@ -189,13 +306,16 @@ def test_a_provider_that_does_not_answer_is_worth_another_attempt(failure):
 @pytest.mark.parametrize(
     ("answer", "message"),
     [
-        ({"embeddings": [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]}, "2 vectors for 1 texts"),
-        ({"embeddings": [[1.0, 0.0]]}, "vector of 2 values, expected 3"),
-        ({"embeddings": [[1.0, 0.0, float("nan")]]}, "not a number"),
-        ({"embeddings": [["a", "b", "c"]]}, "not numeric"),
-        ({"embeddings": [None]}, "where a vector was expected"),
-        ({"embeddings": {}}, "without a embeddings array"),
-        ({}, "without a embeddings array"),
+        (data([1.0, 0.0, 0.0], [1.0, 0.0, 0.0]), "answered 2 of 1 inputs"),
+        (data([1.0, 0.0]), "vector of 2 values, expected 3"),
+        (data([1.0, 0.0, float("nan")]), "not a number"),
+        (data(["a", "b", "c"]), "not numeric"),
+        (data(None), "where a vector was expected"),
+        ({"data": [{"index": 3, "embedding": [1.0, 0.0, 0.0]}]}, "unknown input 3"),
+        ({"data": [{"embedding": [1.0, 0.0, 0.0]}]}, "unknown input None"),
+        ({"data": [[1.0, 0.0, 0.0]]}, "unknown input None"),
+        ({"data": {}}, "without a data array"),
+        ({"embeddings": [[1.0, 0.0, 0.0]]}, "without a data array"),
         ("not json at all", "other than json"),
         ("[1, 2]", "list, expected an object"),
     ],
@@ -207,8 +327,28 @@ def test_an_answer_the_column_would_not_take_is_refused(answer, message):
         Endpoint(client(handler)).embed(SELF_HOSTED, ["текст"])
 
 
+def test_a_boolean_is_not_an_input_index():
+    model = SpaceEmbedding(5, "bge-m3", "BAAI/bge-m3", 3, "http://embed.local", True, "")
+    handler = Recorded(
+        {"data": [{"index": 0, "embedding": [1.0, 0.0, 0.0]}, {"index": True, "embedding": [1.0, 0.0, 0.0]}]}
+    )
+
+    with pytest.raises(PermanentError, match="unknown input True"):
+        Endpoint(client(handler)).embed(model, ["перше", "друге"])
+
+
+def test_an_input_answered_twice_is_refused():
+    model = SpaceEmbedding(5, "bge-m3", "BAAI/bge-m3", 3, "http://embed.local", True, "")
+    handler = Recorded(
+        {"data": [{"index": 0, "embedding": [1.0, 0.0, 0.0]}, {"index": 0, "embedding": [1.0, 0.0, 0.0]}]}
+    )
+
+    with pytest.raises(PermanentError, match="input 0 twice"):
+        Endpoint(client(handler)).embed(model, ["перше", "друге"])
+
+
 def test_an_infinite_value_is_refused_as_well():
-    handler = Recorded({"embeddings": [[1.0, 0.0, float("inf")]]})
+    handler = Recorded(data([1.0, 0.0, float("inf")]))
 
     with pytest.raises(PermanentError, match="not a number"):
         Endpoint(client(handler)).embed(SELF_HOSTED, ["текст"])
@@ -218,6 +358,9 @@ def test_an_infinite_value_is_refused_as_well():
     ("provider", "expected", "batch"),
     [
         ("gemini", Gemini, GEMINI_BATCH),
+        ("openai", OpenAI, OPENAI_BATCH),
+        ("azure", Azure, AZURE_BATCH),
+        ("cohere", Cohere, COHERE_BATCH),
         ("bge-m3", Endpoint, ENDPOINT_BATCH),
         ("e5", Endpoint, ENDPOINT_BATCH),
         ("byom", Endpoint, ENDPOINT_BATCH),
@@ -230,7 +373,7 @@ def test_every_provider_kb_api_can_register_has_a_client(provider, expected, bat
     assert embedder.batch == batch
 
 
-@pytest.mark.parametrize("provider", ["openai", "cohere", "azure", "bge-reranker", ""])
+@pytest.mark.parametrize("provider", ["bge-reranker", ""])
 def test_a_provider_this_worker_cannot_call_is_refused_for_good(provider):
     with pytest.raises(PermanentError, match="unsupported embedding provider"):
         Providers(client(Recorded({}))).for_provider(provider)
@@ -243,3 +386,110 @@ def test_the_client_is_closed_when_the_process_leaves():
         assert embedder._client.timeout.read == 7
 
     assert embedder._client.is_closed
+
+
+AZURE = SpaceEmbedding(
+    model_id=7,
+    provider="azure",
+    model_ref="kb-embeddings",
+    dimensions=3,
+    endpoint="https://kb.openai.azure.com",
+    validated=True,
+    api_key="s3cr3t",
+)
+
+COHERE = SpaceEmbedding(
+    model_id=8,
+    provider="cohere",
+    model_ref="embed-v4.0",
+    dimensions=3,
+    endpoint="http://elsewhere.local",
+    validated=True,
+    api_key="s3cr3t",
+)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ["https://kb.openai.azure.com", "https://kb.openai.azure.com/openai", "https://kb.openai.azure.com/openai/v1/"],
+)
+def test_azure_is_called_at_its_resource_with_the_key_and_the_size(endpoint):
+    handler = Recorded(data([1.0, 0.0, 0.0]))
+    model = SpaceEmbedding(7, "azure", "kb-embeddings", 3, endpoint, True, "s3cr3t")
+
+    vectors = Azure(client(handler)).embed(model, ["текст"])
+
+    request = handler.requests[0]
+    assert vectors == [[1.0, 0.0, 0.0]]
+    assert str(request.url) == "https://kb.openai.azure.com/openai/v1/embeddings"
+    assert request.headers["api-key"] == "s3cr3t"
+    assert "authorization" not in request.headers
+    assert sent(handler) == {"model": "kb-embeddings", "input": ["текст"], "dimensions": 3}
+
+
+def test_an_azure_deployment_without_its_resource_cannot_be_served():
+    model = SpaceEmbedding(7, "azure", "kb-embeddings", 3, "", True, "s3cr3t")
+
+    with pytest.raises(PermanentError, match="no resource url"):
+        Azure(client(Recorded(data([1.0, 0.0, 0.0])))).embed(model, ["текст"])
+
+
+def test_azure_refusing_the_key_is_worth_asking_for_it_again():
+    handler = Recorded({"error": {"code": "401"}}, status=401)
+
+    with pytest.raises(CredentialRefusedError, match="401"):
+        Azure(client(handler)).embed(AZURE, ["текст"])
+
+
+def test_cohere_is_called_at_its_own_api_for_documents():
+    handler = Recorded({"embeddings": {"float": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]}})
+
+    vectors = Cohere(client(handler)).embed(COHERE, ["перше", "друге"])
+
+    request = handler.requests[0]
+    assert vectors == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    assert str(request.url) == "https://api.cohere.com/v2/embed"
+    assert request.headers["authorization"] == "Bearer s3cr3t"
+    assert sent(handler) == {
+        "model": "embed-v4.0",
+        "texts": ["перше", "друге"],
+        "input_type": "search_document",
+        "embedding_types": ["float"],
+        "output_dimension": 3,
+    }
+
+
+def test_a_cohere_model_of_a_fixed_size_is_not_asked_for_one():
+    handler = Recorded({"embeddings": {"float": [[1.0, 0.0, 0.0]]}})
+    model = SpaceEmbedding(8, "cohere", "embed-multilingual-v3.0", 3, "", True, "s3cr3t")
+
+    Cohere(client(handler)).embed(model, ["текст"])
+
+    assert "output_dimension" not in sent(handler)
+
+
+@pytest.mark.parametrize(
+    ("answer", "message"),
+    [
+        ({"embeddings": [[1.0, 0.0, 0.0]]}, "without an embeddings object"),
+        ({"embeddings": {"int8": [[1, 0, 0]]}}, "without a float array"),
+        ({"embeddings": {"float": []}}, "0 vectors for 1 texts"),
+    ],
+)
+def test_a_cohere_answer_out_of_contract_is_refused(answer, message):
+    with pytest.raises(PermanentError, match=message):
+        Cohere(client(Recorded(answer))).embed(COHERE, ["текст"])
+
+
+def test_cohere_has_nothing_to_embed_without_a_call():
+    handler = Recorded({})
+
+    assert Cohere(client(handler)).embed(COHERE, []) == []
+    assert handler.requests == []
+
+
+def test_cohere_refusing_the_key_is_worth_asking_for_it_again():
+    handler = Recorded({"message": "invalid api token"}, status=401)
+
+    with pytest.raises(CredentialRefusedError, match="401"):
+        Cohere(client(handler)).embed(COHERE, ["текст"])
