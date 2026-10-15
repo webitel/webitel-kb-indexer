@@ -126,6 +126,11 @@ def test_a_version_that_is_gone_reads_as_nothing():
     assert store.job(7) is None
 
 
+LOCKED = [(1,)]
+NEWEST = [(False,)]
+SUPERSEDED = [(True,)]
+
+
 @pytest.mark.parametrize(
     ("mark", "state"),
     [
@@ -133,14 +138,50 @@ def test_a_version_that_is_gone_reads_as_nothing():
         ("mark_failed", FAILED),
     ],
 )
-def test_the_state_of_the_article_is_recorded(mark, state):
-    store, cursor = build()
+def test_the_state_of_the_newest_version_is_recorded_under_the_article_lock(mark, state):
+    store, cursor = build(results=[LOCKED, NEWEST, []])
 
-    getattr(store, mark)(3)
+    getattr(store, mark)(3, 7)
+
+    lock, newer, update = cursor.calls
+    assert lock == ("SELECT 1 FROM kb.article WHERE id = %(article_id)s FOR UPDATE", {"article_id": 3})
+    assert newer[1] == {"version_id": 7}
+    assert update[1] == {"article_id": 3, "version_id": 7, "state": state}
+    assert "UPDATE kb.article SET index_state = %(state)s WHERE id = %(article_id)s" in update[0]
+    # A repeat of a published version must not take the article back.
+    assert "published_version_id IS DISTINCT FROM %(version_id)s" in update[0]
+
+
+@pytest.mark.parametrize("mark", ["mark_indexing", "mark_failed"])
+def test_a_superseded_version_leaves_the_state_to_the_newer_one(mark):
+    store, cursor = build(results=[LOCKED, SUPERSEDED])
+
+    getattr(store, mark)(3, 7)
+
+    assert len(cursor.calls) == 2
+    assert not any(sql.startswith("UPDATE") for sql in cursor.statements())
+
+
+def test_the_state_check_and_write_are_one_transaction():
+    pool = FakePool(FakeCursor([LOCKED, NEWEST, []]))
+    store = Store(cast(ConnectionPool[Connection[TupleRow]], pool))
+
+    store.mark_failed(3, 7)
+
+    assert pool.connection_calls == 1
+
+
+@pytest.mark.parametrize(("answer", "superseded"), [(SUPERSEDED, True), (NEWEST, False), ([], False)])
+def test_a_version_is_superseded_by_any_newer_version_of_its_article(answer, superseded):
+    store, cursor = build(results=[answer])
+
+    assert store.superseded(7) is superseded
 
     sql, params = cursor.calls[0]
-    assert params == {"article_id": 3, "state": state}
-    assert "UPDATE kb.article SET index_state = %(state)s WHERE id = %(article_id)s" in sql
+    assert params == {"version_id": 7}
+    assert "JOIN kb.article_version newer" in sql
+    assert "newer.article_id = mine.article_id AND newer.version_number > mine.version_number" in sql
+    assert "WHERE mine.id = %(version_id)s" in sql
 
 
 def test_chunks_are_written_without_duplicating_what_is_there():
@@ -232,29 +273,32 @@ def test_a_vector_is_written_the_way_pgvector_reads_one():
     ],
 )
 def test_publishing_reports_whether_this_version_is_the_published_one(pointer, published):
-    store, _cursor = build(results=[pointer, []])
+    store, _cursor = build(results=[LOCKED, NEWEST, pointer, []])
 
     assert store.publish(3, 7, 2) is published
 
 
-def test_the_pointer_moves_only_forward_and_the_state_is_recorded_either_way():
-    store, cursor = build(results=[[(7,)], []])
+@pytest.mark.parametrize(("answer", "newest"), [(NEWEST, True), (SUPERSEDED, False)])
+def test_the_pointer_moves_only_forward_and_only_the_newest_version_records_the_state(answer, newest):
+    store, cursor = build(results=[LOCKED, answer, [(7,)], []])
 
     store.publish(3, 7, 2)
 
-    sql, params = cursor.calls[0]
-    assert params == {"article_id": 3, "version_id": 7, "version_number": 2, "state": INDEXED}
+    lock, _newer, update, _retention = cursor.calls
+    assert "FOR UPDATE" in lock[0]
+    sql, params = update
+    assert params == {"article_id": 3, "version_id": 7, "version_number": 2, "state": INDEXED, "newest": newest}
     assert "%(version_number)s > (" in sql
     assert "ELSE a.published_version_id" in sql
-    assert "index_state = %(state)s" in sql
+    assert "index_state = CASE WHEN %(newest)s THEN %(state)s ELSE a.index_state END" in sql
 
 
 def test_only_versions_older_than_the_published_one_lose_their_chunks():
-    store, cursor = build(results=[[(7,)], []])
+    store, cursor = build(results=[LOCKED, NEWEST, [(7,)], []])
 
     store.publish(3, 7, 2)
 
-    sql, params = cursor.calls[1]
+    sql, params = cursor.calls[3]
     assert params == {"article_id": 3}
     assert "DELETE FROM kb.chunk c" in sql
     assert "v.version_number < (" in sql
@@ -262,12 +306,23 @@ def test_only_versions_older_than_the_published_one_lose_their_chunks():
 
 
 def test_the_swap_and_the_cleanup_are_one_transaction():
-    pool = FakePool(FakeCursor([[(7,)], []]))
+    pool = FakePool(FakeCursor([LOCKED, NEWEST, [(7,)], []]))
     store = Store(cast(ConnectionPool[Connection[TupleRow]], pool))
 
     store.publish(3, 7, 2)
 
     assert pool.connection_calls == 1
+
+
+def test_pruning_drops_only_what_is_older_than_the_published_version():
+    store, cursor = build()
+
+    store.prune(3)
+
+    [(sql, params)] = cursor.calls
+    assert params == {"article_id": 3}
+    assert "DELETE FROM kb.chunk c" in sql
+    assert "v.version_number < (" in sql
 
 
 def test_a_database_that_is_down_is_worth_another_attempt():

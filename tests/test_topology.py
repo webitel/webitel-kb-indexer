@@ -62,5 +62,5 @@ def test_an_object_is_declared_before_it_is_bound():
 
 
 def test_one_delivery_at_a_time():
-    """Per-article order in v1 rests on this and on a single relay."""
+    """A process works on one article at a time; replicas add parallelism."""
     assert topology.PREFETCH == 1
