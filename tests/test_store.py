@@ -146,10 +146,11 @@ def test_the_state_of_the_newest_version_is_recorded_under_the_article_lock(mark
     lock, newer, update = cursor.calls
     assert lock == ("SELECT 1 FROM kb.article WHERE id = %(article_id)s FOR UPDATE", {"article_id": 3})
     assert newer[1] == {"version_id": 7}
-    assert update[1] == {"article_id": 3, "version_id": 7, "state": state}
+    assert update[1] == {"article_id": 3, "version_id": 7, "state": state, "indexed": INDEXED}
     assert "UPDATE kb.article SET index_state = %(state)s WHERE id = %(article_id)s" in update[0]
-    # A repeat of a published version must not take the article back.
-    assert "published_version_id IS DISTINCT FROM %(version_id)s" in update[0]
+    # A repeat of an indexed version must not take the article back; a reindex
+    # of the published version still moves it.
+    assert "published_version_id IS DISTINCT FROM %(version_id)s OR index_state <> %(indexed)s" in update[0]
 
 
 @pytest.mark.parametrize("mark", ["mark_indexing", "mark_failed"])

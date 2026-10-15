@@ -60,11 +60,12 @@ SELECT EXISTS (
 )
 """
 
-# A published version is past indexing and failing: a repeat of its job must
-# not take the article back.
+# A version already indexed is past indexing and failing: a repeat of its job
+# must not take the article back. A reindex asked for it still moves it.
 STATE_SQL = """
 UPDATE kb.article SET index_state = %(state)s
-WHERE id = %(article_id)s AND published_version_id IS DISTINCT FROM %(version_id)s
+WHERE id = %(article_id)s
+  AND (published_version_id IS DISTINCT FROM %(version_id)s OR index_state <> %(indexed)s)
 """
 
 # Chunks whose text changed leave their vectors describing the text that was.
@@ -276,7 +277,10 @@ class Store:
             if _superseded(cursor, version_id):
                 return
 
-            cursor.execute(STATE_SQL, {"article_id": article_id, "version_id": version_id, "state": state})
+            cursor.execute(
+                STATE_SQL,
+                {"article_id": article_id, "version_id": version_id, "state": state, "indexed": INDEXED},
+            )
 
     @contextmanager
     def _connection(self) -> Iterator[Connection[TupleRow]]:
