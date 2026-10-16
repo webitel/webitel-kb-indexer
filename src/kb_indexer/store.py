@@ -26,7 +26,11 @@ FAILED = 4
 POOL_MIN = 1
 POOL_MAX = 2
 
-JOB_SQL = """
+# The model the space searches with, 0 when it has none: the job embeds for
+# this one only.
+_SEARCH_MODEL = "CASE WHEN s.vector_search_enabled THEN COALESCE(s.embedding_model_id, 0) ELSE 0 END"
+
+JOB_SQL = f"""
 SELECT v.id AS version_id,
        v.article_id,
        a.space_id,
@@ -35,12 +39,13 @@ SELECT v.id AS version_id,
        v.subject,
        v.body_markdown,
        a.deleted_at IS NOT NULL AS article_deleted,
-       s.chunking_strategy
+       s.chunking_strategy,
+       {_SEARCH_MODEL} AS model_id
 FROM kb.article_version v
 JOIN kb.article a ON a.id = v.article_id
 JOIN kb.space s ON s.id = a.space_id
 WHERE v.id = %(version_id)s
-"""
+"""  # noqa: S608 - a constant fragment, no input
 
 # Taken before a state is written. A save of the article holds this row until
 # it commits, so the statements after it see the version that save added.
@@ -48,17 +53,27 @@ LOCK_ARTICLE_SQL = """
 SELECT 1 FROM kb.article WHERE id = %(article_id)s FOR UPDATE
 """
 
-# Whether the article has a version newer than this one. Every version has its
-# own job, so the newest one speaks for the article.
-SUPERSEDED_SQL = """
+# Whether the article has a version newer than this one, or the space now
+# searches with another model. Every version has its own job, and a change of
+# the model queues one more: the newest job speaks for the article. Without a
+# model only a newer version counts.
+SUPERSEDED_SQL = f"""
 SELECT EXISTS (
     SELECT 1
     FROM kb.article_version mine
     JOIN kb.article_version newer
       ON newer.article_id = mine.article_id AND newer.version_number > mine.version_number
     WHERE mine.id = %(version_id)s
+) OR EXISTS (
+    SELECT 1
+    FROM kb.article_version mine
+    JOIN kb.article a ON a.id = mine.article_id
+    JOIN kb.space s ON s.id = a.space_id
+    WHERE mine.id = %(version_id)s
+      AND %(model_id)s::bigint IS NOT NULL
+      AND {_SEARCH_MODEL} <> %(model_id)s::bigint
 )
-"""
+"""  # noqa: S608 - a constant fragment, no input
 
 # A version already indexed is past indexing and failing: a repeat of its job
 # must not take the article back. A reindex asked for it still moves it.
@@ -136,6 +151,19 @@ WHERE c.version_id = v.id
       )
 """
 
+# Vectors of a model the space no longer has. The space drops them when its
+# model changes; this catches what a job of the old model wrote after that.
+DROP_FOREIGN_EMBEDDINGS_SQL = """
+DELETE FROM kb.chunk_embedding e
+USING kb.chunk c, kb.article_version v, kb.article a, kb.space s
+WHERE e.chunk_id = c.id
+  AND c.version_id = v.id
+  AND v.article_id = %(article_id)s
+  AND a.id = v.article_id
+  AND s.id = a.space_id
+  AND e.model_id IS DISTINCT FROM s.embedding_model_id
+"""
+
 # Which of these chunks the model has already been run over. A repeat of a
 # delivery, and a retry after a failed batch, then cost the provider nothing.
 EMBEDDED_SQL = """
@@ -143,14 +171,16 @@ SELECT chunk_id FROM kb.chunk_embedding
 WHERE model_id = %(model_id)s AND chunk_id = ANY(%(chunk_ids)s)
 """
 
-# One vector per chunk and model: a repeat replaces it. The scope rides on the
-# row so a filtered search needs no join before it ranks. Every vector size has
-# its own column, embedding_<dimensions>, named by write_embedding_sql.
+# One vector per chunk and model. A repeat keeps the stored one: a chunk whose
+# text changed has lost its vectors already, so the same model gave the same
+# vector, and taking no row lock keeps a model switch from deadlocking with it.
+# The scope rides on the row so a filtered search needs no join before it
+# ranks. Every vector size has its own column, embedding_<dimensions>, named
+# by write_embedding_sql.
 _WRITE_EMBEDDING_SQL = """
 INSERT INTO kb.chunk_embedding (chunk_id, model_id, domain_id, space_id, {column})
 VALUES (%(chunk_id)s, %(model_id)s, %(domain_id)s, %(space_id)s, %(embedding)s::vector)
-ON CONFLICT (chunk_id, model_id) DO UPDATE
-SET {column} = EXCLUDED.{column}, created_at = now()
+ON CONFLICT (chunk_id, model_id) DO NOTHING
 """
 
 
@@ -172,6 +202,7 @@ class Job:
     body_markdown: str
     article_deleted: bool
     chunking_strategy: str
+    model_id: int
 
 
 class Store:
@@ -188,18 +219,21 @@ class Store:
 
         return found
 
-    def superseded(self, version_id: int) -> bool:
-        """Whether the article has a newer version than this one."""
+    def superseded(self, version_id: int, model_id: int) -> bool:
+        """Whether a newer version or another model of the space took over."""
         with self._connection() as connection, connection.cursor() as cursor:
-            return _superseded(cursor, version_id)
+            return _superseded(cursor, version_id, model_id)
 
-    def mark_indexing(self, article_id: int, version_id: int) -> None:
-        """Record that the article is being indexed, unless a newer version speaks for it."""
-        self._mark(article_id, version_id, INDEXING)
+    def mark_indexing(self, article_id: int, version_id: int, model_id: int) -> None:
+        """Record that the article is being indexed, unless a newer job speaks for it."""
+        self._mark(article_id, version_id, model_id, INDEXING)
 
-    def mark_failed(self, article_id: int, version_id: int) -> None:
-        """Record that the article was not indexed, unless a newer version speaks for it."""
-        self._mark(article_id, version_id, FAILED)
+    def mark_failed(self, article_id: int, version_id: int, model_id: int | None) -> None:
+        """Record that the article was not indexed, unless a newer job speaks for it.
+
+        Without a model only a newer version takes over.
+        """
+        self._mark(article_id, version_id, model_id, FAILED)
 
     def write_chunks(self, version_id: int, contents: list[str]) -> list[int]:
         """Replace the chunks of a version, returning their ids in reading order."""
@@ -213,14 +247,14 @@ class Store:
 
         return [chunk_id for chunk_id, _ in sorted(written, key=lambda row: row[1])]
 
-    def publish(self, article_id: int, version_id: int, version_number: int) -> bool:
+    def publish(self, article_id: int, version_id: int, version_number: int, model_id: int) -> bool:
         """Point the article at the version and drop what is no longer published.
 
         Returns whether this version is the published one.
         """
         with self._connection() as connection, connection.cursor() as cursor:
             cursor.execute(LOCK_ARTICLE_SQL, {"article_id": article_id})
-            newest = not _superseded(cursor, version_id)
+            newest = not _superseded(cursor, version_id, model_id)
             cursor.execute(
                 PUBLISH_SQL,
                 {
@@ -232,14 +266,14 @@ class Store:
                 },
             )
             published = cursor.fetchone()
-            cursor.execute(RETENTION_SQL, {"article_id": article_id})
+            _drop_unpublished(cursor, article_id)
 
         return published is not None and published[0] == version_id
 
     def prune(self, article_id: int) -> None:
-        """Drop the chunks of the versions older than the published one."""
+        """Drop the chunks older than the published version and the vectors of other models."""
         with self._connection() as connection, connection.cursor() as cursor:
-            cursor.execute(RETENTION_SQL, {"article_id": article_id})
+            _drop_unpublished(cursor, article_id)
 
     def embedded(self, model_id: int, chunk_ids: list[int]) -> set[int]:
         """Which of the chunks already carry a vector of the model."""
@@ -271,10 +305,10 @@ class Store:
         with self._connection() as connection, connection.cursor() as cursor:
             cursor.executemany(write_embedding_sql(dimensions), rows)
 
-    def _mark(self, article_id: int, version_id: int, state: int) -> None:
+    def _mark(self, article_id: int, version_id: int, model_id: int | None, state: int) -> None:
         with self._connection() as connection, connection.cursor() as cursor:
             cursor.execute(LOCK_ARTICLE_SQL, {"article_id": article_id})
-            if _superseded(cursor, version_id):
+            if _superseded(cursor, version_id, model_id):
                 return
 
             cursor.execute(
@@ -296,12 +330,18 @@ class Store:
             raise PermanentError(msg) from refused
 
 
-def _superseded(cursor: Cursor[TupleRow], version_id: int) -> bool:
-    """Whether the article has a newer version, read in the caller's transaction."""
-    cursor.execute(SUPERSEDED_SQL, {"version_id": version_id})
+def _superseded(cursor: Cursor[TupleRow], version_id: int, model_id: int | None) -> bool:
+    """Whether a newer job took over, read in the caller's transaction."""
+    cursor.execute(SUPERSEDED_SQL, {"version_id": version_id, "model_id": model_id})
     found = cursor.fetchone()
 
     return found is not None and bool(found[0])
+
+
+def _drop_unpublished(cursor: Cursor[TupleRow], article_id: int) -> None:
+    """Keep only the chunks of the published version and the vectors of the space model."""
+    cursor.execute(RETENTION_SQL, {"article_id": article_id})
+    cursor.execute(DROP_FOREIGN_EMBEDDINGS_SQL, {"article_id": article_id})
 
 
 def vector_literal(vector: list[float]) -> str:
