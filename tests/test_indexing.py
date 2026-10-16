@@ -31,6 +31,7 @@ JOB = Job(
     body_markdown="# Через портал\n\nВідкрийте профіль і натисніть «Забули пароль».",
     article_deleted=False,
     chunking_strategy=chunking.STRATEGY,
+    model_id=4,
 )
 
 MODEL = SpaceEmbedding(
@@ -42,6 +43,9 @@ MODEL = SpaceEmbedding(
     validated=True,
     api_key="",
 )
+
+# A space that searches without vectors.
+UNEMBEDDED = replace(JOB, model_id=0)
 
 # Six sections: enough for several batches of a small provider.
 LONG_BODY = "\n\n".join(f"## Розділ {number}\n\nТекст розділу." for number in range(6))
@@ -62,8 +66,8 @@ class FakeStore:
 
         return self._job
 
-    def superseded(self, version_id):
-        self.calls.append(("superseded", version_id))
+    def superseded(self, version_id, model_id):
+        self.calls.append(("superseded", version_id, model_id))
 
         if self._checks_before_newer is None:
             return False
@@ -75,8 +79,8 @@ class FakeStore:
 
         return True
 
-    def mark_indexing(self, article_id, version_id):
-        self.calls.append(("mark_indexing", article_id, version_id))
+    def mark_indexing(self, article_id, version_id, model_id):
+        self.calls.append(("mark_indexing", article_id, version_id, model_id))
 
     def write_chunks(self, version_id, contents):
         self.calls.append(("write_chunks", version_id, contents))
@@ -91,26 +95,27 @@ class FakeStore:
     def write_embeddings(self, job, model_id, dimensions, vectors):
         self.calls.append(("write_embeddings", job, model_id, dimensions, vectors))
 
-    def publish(self, article_id, version_id, version_number):
-        self.calls.append(("publish", article_id, version_id, version_number))
+    def publish(self, article_id, version_id, version_number, model_id):
+        self.calls.append(("publish", article_id, version_id, version_number, model_id))
 
         return self._published
 
     def prune(self, article_id):
         self.calls.append(("prune", article_id))
 
-    def mark_failed(self, article_id, version_id):
-        self.calls.append(("mark_failed", article_id, version_id))
+    def mark_failed(self, article_id, version_id, model_id):
+        self.calls.append(("mark_failed", article_id, version_id, model_id))
 
 
 class FakeResolver:
     """Records what the pipeline asked of kb-api."""
 
-    def __init__(self, journal, model=MODEL, failure=None):
+    def __init__(self, journal, model=MODEL, failure=None, after_forget=None):
         self.calls = journal
         self.forgotten = []
         self._model = model
         self._failure = failure
+        self._after_forget = after_forget
 
     def resolve(self, space_id):
         self.calls.append(("resolve", space_id))
@@ -123,6 +128,9 @@ class FakeResolver:
     def forget(self, space_id):
         self.calls.append(("forget", space_id))
         self.forgotten.append(space_id)
+
+        if self._after_forget is not None:
+            self._model = self._after_forget
 
 
 class FakeEmbedder:
@@ -176,6 +184,7 @@ class Pipeline:
             self.journal,
             model=built.get("model", MODEL),
             failure=built.get("unresolvable"),
+            after_forget=built.get("after_forget"),
         )
         self.embedder = FakeEmbedder(self.journal, batch=built.get("batch", 10), failure=built.get("failure"))
         self.handler = IndexingHandler(
@@ -218,9 +227,9 @@ def test_a_version_is_chunked_embedded_and_published():
         "publish",
     ]
     assert pipeline.entry("job") == ("job", 7)
-    assert pipeline.entry("superseded") == ("superseded", 7)
-    assert pipeline.entry("mark_indexing") == ("mark_indexing", 3, 7)
-    assert pipeline.entry("publish") == ("publish", 3, 7, 2)
+    assert pipeline.entry("superseded") == ("superseded", 7, 4)
+    assert pipeline.entry("mark_indexing") == ("mark_indexing", 3, 7, 4)
+    assert pipeline.entry("publish") == ("publish", 3, 7, 2, 4)
 
 
 def test_the_space_is_resolved_before_anything_is_written():
@@ -268,7 +277,7 @@ def test_the_vectors_are_stored_against_the_chunks_they_describe():
 
 
 def test_a_space_without_vector_search_is_indexed_without_vectors(caplog):
-    pipeline = Pipeline(model=None)
+    pipeline = Pipeline(job=UNEMBEDDED, model=None)
 
     with caplog.at_level("INFO"):
         pipeline.handle()
@@ -309,23 +318,24 @@ def test_every_batch_is_stored_before_the_next_one_is_asked_for():
     assert [len(entry[1]) for entry in pipeline.entries("embed")] == [2, 2, 2]
 
 
-def test_a_refused_credential_is_forgotten_and_the_delivery_is_retried():
-    pipeline = Pipeline(failure=CredentialRefusedError("the provider returned status 401"))
+@pytest.mark.parametrize(
+    ("failure", "forgotten"),
+    [
+        (CredentialRefusedError("the provider returned status 401"), [5]),
+        (TransientError("the provider is unreachable: connection refused"), [5]),
+        (TransientError("the provider returned status 503"), [5]),
+        (PermanentError("the provider returned status 400"), []),
+    ],
+    ids=["refused key", "unreachable", "unavailable", "refused request"],
+)
+def test_a_failed_call_is_retried_with_the_model_asked_again(failure, forgotten):
+    pipeline = Pipeline(failure=failure)
 
-    with pytest.raises(CredentialRefusedError):
+    with pytest.raises(type(failure)):
         pipeline.handle()
 
-    assert pipeline.resolver.forgotten == [5]
+    assert pipeline.resolver.forgotten == forgotten
     assert "write_embeddings" not in pipeline.steps()
-
-
-def test_a_provider_that_fails_otherwise_leaves_the_resolved_model_alone():
-    pipeline = Pipeline(failure=TransientError("the provider returned status 503"))
-
-    with pytest.raises(TransientError):
-        pipeline.handle()
-
-    assert pipeline.resolver.forgotten == []
 
 
 def test_a_body_that_yields_nothing_still_replaces_what_is_stored():
@@ -387,7 +397,7 @@ def test_a_late_job_finishes_without_moving_the_pointer(caplog):
     with caplog.at_level("INFO"):
         pipeline.handle()
 
-    assert pipeline.entry("publish") == ("publish", 3, 7, 2)
+    assert pipeline.entry("publish") == ("publish", 3, 7, 2, 4)
     assert caplog.records[-1].published is False
 
 
@@ -401,7 +411,7 @@ def test_the_lag_is_recorded_from_the_edit_once_the_version_is_published():
 
 
 def test_a_space_without_vector_search_reports_its_lag_apart():
-    pipeline = Pipeline(model=None)
+    pipeline = Pipeline(job=UNEMBEDDED, model=None)
 
     pipeline.handle()
 
@@ -460,7 +470,7 @@ def test_giving_up_marks_the_article_failed():
 
     pipeline.handler.give_up(EVENT)
 
-    assert pipeline.journal == [("mark_failed", 3, 7)]
+    assert pipeline.journal == [("mark_failed", 3, 7, None)]
 
 
 def test_a_version_with_a_newer_one_is_left_to_the_newer_job(caplog):
@@ -471,7 +481,7 @@ def test_a_version_with_a_newer_one_is_left_to_the_newer_job(caplog):
 
     assert pipeline.steps() == ["job", "superseded", "prune"]
     assert pipeline.entry("prune") == ("prune", 3)
-    assert caplog.records[-1].message == "superseded by a newer version"
+    assert caplog.records[-1].message == "superseded by a newer version or model"
     assert pipeline.recorded.points("webitel.kb.article.index.duration") == []
 
 
@@ -501,8 +511,10 @@ def test_a_failure_of_a_version_a_newer_one_replaced_ends_quietly(failure):
 
     pipeline.handle()
 
-    assert pipeline.steps()[-3:] == ["embed", "superseded", "prune"]
+    assert "embed" in pipeline.steps()
+    assert pipeline.steps()[-2:] == ["superseded", "prune"]
     assert "publish" not in pipeline.steps()
+    assert {entry[2] for entry in pipeline.entries("superseded")} == {4}
 
 
 @pytest.mark.parametrize(
@@ -542,3 +554,42 @@ def test_the_chunk_policy_is_the_one_it_was_given():
     _step, _version_id, contents = pipeline.entry("write_chunks")
     assert len(contents) > 1
     assert max(len(chunk) for chunk in contents) <= 200
+
+
+def test_a_model_the_cache_held_from_before_is_asked_again():
+    pipeline = Pipeline(model=replace(MODEL, model_id=9), after_forget=MODEL)
+
+    pipeline.handle()
+
+    assert pipeline.steps()[3:6] == ["resolve", "forget", "resolve"]
+    assert pipeline.resolver.forgotten == [5]
+    _step, _job, model_id, _dimensions, _vectors = pipeline.entry("write_embeddings")
+    assert model_id == 4
+    assert pipeline.entry("publish") == ("publish", 3, 7, 2, 4)
+
+
+@pytest.mark.parametrize(
+    ("job", "model"),
+    [
+        (JOB, replace(MODEL, model_id=9)),
+        (JOB, None),
+        (UNEMBEDDED, MODEL),
+    ],
+    ids=["another model", "vector search off", "vector search on"],
+)
+def test_kb_api_that_disagrees_with_the_database_is_asked_again_later(job, model):
+    pipeline = Pipeline(job=job, model=model)
+
+    with pytest.raises(TransientError, match="the database holds"):
+        pipeline.handle()
+
+    assert pipeline.steps()[3:] == ["resolve", "forget", "resolve", "superseded", "superseded"]
+    assert "write_chunks" not in pipeline.steps()
+
+
+def test_a_model_the_space_changed_since_the_job_was_read_is_left_to_the_new_job():
+    pipeline = Pipeline(model=replace(MODEL, model_id=9), superseded_after=1)
+
+    pipeline.handle()
+
+    assert pipeline.steps()[3:] == ["resolve", "forget", "resolve", "superseded", "prune"]
