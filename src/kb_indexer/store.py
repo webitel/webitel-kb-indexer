@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 import psycopg
-from psycopg import Connection
+from psycopg import Connection, Cursor
 from psycopg.rows import TupleRow, class_row
 from psycopg_pool import ConnectionPool
 
@@ -42,8 +42,30 @@ JOIN kb.space s ON s.id = a.space_id
 WHERE v.id = %(version_id)s
 """
 
+# Taken before a state is written. A save of the article holds this row until
+# it commits, so the statements after it see the version that save added.
+LOCK_ARTICLE_SQL = """
+SELECT 1 FROM kb.article WHERE id = %(article_id)s FOR UPDATE
+"""
+
+# Whether the article has a version newer than this one. Every version has its
+# own job, so the newest one speaks for the article.
+SUPERSEDED_SQL = """
+SELECT EXISTS (
+    SELECT 1
+    FROM kb.article_version mine
+    JOIN kb.article_version newer
+      ON newer.article_id = mine.article_id AND newer.version_number > mine.version_number
+    WHERE mine.id = %(version_id)s
+)
+"""
+
+# A version already indexed is past indexing and failing: a repeat of its job
+# must not take the article back. A reindex asked for it still moves it.
 STATE_SQL = """
-UPDATE kb.article SET index_state = %(state)s WHERE id = %(article_id)s
+UPDATE kb.article SET index_state = %(state)s
+WHERE id = %(article_id)s
+  AND (published_version_id IS DISTINCT FROM %(version_id)s OR index_state <> %(indexed)s)
 """
 
 # Chunks whose text changed leave their vectors describing the text that was.
@@ -80,8 +102,7 @@ DELETE FROM kb.chunk WHERE version_id = %(version_id)s AND chunk_index >= %(coun
 """
 
 # The pointer moves only forward, so a job that arrives late cannot publish an
-# older version; the state is recorded either way, or a late job would leave
-# the article indexing for good.
+# older version. The state is the newest version's to record.
 PUBLISH_SQL = """
 UPDATE kb.article a
 SET published_version_id = CASE
@@ -94,7 +115,7 @@ SET published_version_id = CASE
         THEN %(version_id)s
         ELSE a.published_version_id
     END,
-    index_state = %(state)s
+    index_state = CASE WHEN %(newest)s THEN %(state)s ELSE a.index_state END
 WHERE a.id = %(article_id)s
 RETURNING published_version_id
 """
@@ -167,13 +188,18 @@ class Store:
 
         return found
 
-    def mark_indexing(self, article_id: int) -> None:
-        """Record that the article is being indexed."""
-        self._mark(article_id, INDEXING)
+    def superseded(self, version_id: int) -> bool:
+        """Whether the article has a newer version than this one."""
+        with self._connection() as connection, connection.cursor() as cursor:
+            return _superseded(cursor, version_id)
 
-    def mark_failed(self, article_id: int) -> None:
-        """Record that the article was not indexed."""
-        self._mark(article_id, FAILED)
+    def mark_indexing(self, article_id: int, version_id: int) -> None:
+        """Record that the article is being indexed, unless a newer version speaks for it."""
+        self._mark(article_id, version_id, INDEXING)
+
+    def mark_failed(self, article_id: int, version_id: int) -> None:
+        """Record that the article was not indexed, unless a newer version speaks for it."""
+        self._mark(article_id, version_id, FAILED)
 
     def write_chunks(self, version_id: int, contents: list[str]) -> list[int]:
         """Replace the chunks of a version, returning their ids in reading order."""
@@ -193,6 +219,8 @@ class Store:
         Returns whether this version is the published one.
         """
         with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(LOCK_ARTICLE_SQL, {"article_id": article_id})
+            newest = not _superseded(cursor, version_id)
             cursor.execute(
                 PUBLISH_SQL,
                 {
@@ -200,12 +228,18 @@ class Store:
                     "version_id": version_id,
                     "version_number": version_number,
                     "state": INDEXED,
+                    "newest": newest,
                 },
             )
             published = cursor.fetchone()
             cursor.execute(RETENTION_SQL, {"article_id": article_id})
 
         return published is not None and published[0] == version_id
+
+    def prune(self, article_id: int) -> None:
+        """Drop the chunks of the versions older than the published one."""
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(RETENTION_SQL, {"article_id": article_id})
 
     def embedded(self, model_id: int, chunk_ids: list[int]) -> set[int]:
         """Which of the chunks already carry a vector of the model."""
@@ -237,9 +271,16 @@ class Store:
         with self._connection() as connection, connection.cursor() as cursor:
             cursor.executemany(write_embedding_sql(dimensions), rows)
 
-    def _mark(self, article_id: int, state: int) -> None:
+    def _mark(self, article_id: int, version_id: int, state: int) -> None:
         with self._connection() as connection, connection.cursor() as cursor:
-            cursor.execute(STATE_SQL, {"article_id": article_id, "state": state})
+            cursor.execute(LOCK_ARTICLE_SQL, {"article_id": article_id})
+            if _superseded(cursor, version_id):
+                return
+
+            cursor.execute(
+                STATE_SQL,
+                {"article_id": article_id, "version_id": version_id, "state": state, "indexed": INDEXED},
+            )
 
     @contextmanager
     def _connection(self) -> Iterator[Connection[TupleRow]]:
@@ -253,6 +294,14 @@ class Store:
         except psycopg.Error as refused:
             msg = f"the database refused the statement: {refused}"
             raise PermanentError(msg) from refused
+
+
+def _superseded(cursor: Cursor[TupleRow], version_id: int) -> bool:
+    """Whether the article has a newer version, read in the caller's transaction."""
+    cursor.execute(SUPERSEDED_SQL, {"version_id": version_id})
+    found = cursor.fetchone()
+
+    return found is not None and bool(found[0])
 
 
 def vector_literal(vector: list[float]) -> str:

@@ -10,7 +10,7 @@ from typing import Protocol
 from kb_indexer import chunking
 from kb_indexer.embedding import CredentialRefusedError, Embedder
 from kb_indexer.events import ArticleReindex
-from kb_indexer.handler import PermanentError
+from kb_indexer.handler import PermanentError, TransientError
 from kb_indexer.metrics import Metrics
 from kb_indexer.resolver import SpaceEmbedding
 from kb_indexer.store import Job
@@ -25,12 +25,16 @@ class Storage(Protocol):
         """Read the version to index."""
         ...
 
-    def mark_indexing(self, article_id: int) -> None:
-        """Record that the article is being indexed."""
+    def superseded(self, version_id: int) -> bool:
+        """Whether the article has a newer version than this one."""
         ...
 
-    def mark_failed(self, article_id: int) -> None:
-        """Record that the article was not indexed."""
+    def mark_indexing(self, article_id: int, version_id: int) -> None:
+        """Record that the article is being indexed, unless a newer version speaks for it."""
+        ...
+
+    def mark_failed(self, article_id: int, version_id: int) -> None:
+        """Record that the article was not indexed, unless a newer version speaks for it."""
         ...
 
     def write_chunks(self, version_id: int, contents: list[str]) -> list[int]:
@@ -55,6 +59,10 @@ class Storage(Protocol):
         """Point the article at the version and drop what is no longer published."""
         ...
 
+    def prune(self, article_id: int) -> None:
+        """Drop the chunks of the versions older than the published one."""
+        ...
+
 
 class Resolving(Protocol):
     """kb-api, as the pipeline uses it."""
@@ -74,6 +82,10 @@ class Providing(Protocol):
     def for_provider(self, provider: str) -> Embedder:
         """The client of a provider."""
         ...
+
+
+class _SupersededError(Exception):
+    """The article has a newer version, and its own job does the rest."""
 
 
 class IndexingHandler:
@@ -102,7 +114,26 @@ class IndexingHandler:
             return
 
         self._accept(event, job)
-        self._store.mark_indexing(job.article_id)
+
+        try:
+            self._index(event, job)
+        except _SupersededError:
+            self._leave(event, job)
+        except (PermanentError, TransientError):
+            # A failure of a version nobody needs anymore is not a failure.
+            if not self._store.superseded(job.version_id):
+                raise
+
+            self._leave(event, job)
+
+    def give_up(self, event: ArticleReindex) -> None:
+        """Record that the article will not be indexed from this event."""
+        self._store.mark_failed(event.article_id, event.version_id)
+
+    def _index(self, event: ArticleReindex, job: Job) -> None:
+        """Chunk, embed and publish one version."""
+        self._ensure_newest(job)
+        self._store.mark_indexing(job.article_id, job.version_id)
 
         model = self._resolver.resolve(job.space_id)
         embedder = None if model is None else self._providers.for_provider(model.provider)
@@ -126,9 +157,15 @@ class IndexingHandler:
             },
         )
 
-    def give_up(self, event: ArticleReindex) -> None:
-        """Record that the article will not be indexed from this event."""
-        self._store.mark_failed(event.article_id)
+    def _leave(self, event: ArticleReindex, job: Job) -> None:
+        """End a job a newer version took over, keeping only what is published."""
+        self._store.prune(job.article_id)
+        log.info("superseded by a newer version", extra=event.as_fields())
+
+    def _ensure_newest(self, job: Job) -> None:
+        """Stop the work once a newer version exists."""
+        if self._store.superseded(job.version_id):
+            raise _SupersededError
 
     def _embed(
         self,
@@ -149,6 +186,8 @@ class IndexingHandler:
 
         written = 0
         for batch in _batched(pending, embedder.batch):
+            # A long article can take minutes; a newer version must not wait for it.
+            self._ensure_newest(job)
             try:
                 vectors = self._call(model, embedder, [content for _chunk_id, content in batch])
             except CredentialRefusedError:

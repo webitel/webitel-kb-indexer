@@ -27,7 +27,8 @@ CONTENT_TYPE = "application/json"
 # The outbox id of the message, for tracing. Never a deduplication key.
 MESSAGE_ID_HEADER = "x-message-id"
 
-# One delivery at a time: this is what keeps per-article order in v1.
+# One delivery at a time per process. Replicas add parallelism; the store keeps
+# the article right whatever order its versions are indexed in.
 PREFETCH = 1
 
 

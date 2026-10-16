@@ -43,23 +43,40 @@ MODEL = SpaceEmbedding(
     api_key="",
 )
 
+# Six sections: enough for several batches of a small provider.
+LONG_BODY = "\n\n".join(f"## Розділ {number}\n\nТекст розділу." for number in range(6))
+
 
 class FakeStore:
     """Records what the pipeline asked of the database."""
 
-    def __init__(self, journal, job=JOB, stored=(), published=True):
+    def __init__(self, journal, job=JOB, stored=(), published=True, superseded_after=None):
         self.calls = journal
         self._job = job
         self._stored = set(stored)
         self._published = published
+        self._checks_before_newer = superseded_after
 
     def job(self, version_id):
         self.calls.append(("job", version_id))
 
         return self._job
 
-    def mark_indexing(self, article_id):
-        self.calls.append(("mark_indexing", article_id))
+    def superseded(self, version_id):
+        self.calls.append(("superseded", version_id))
+
+        if self._checks_before_newer is None:
+            return False
+
+        if self._checks_before_newer > 0:
+            self._checks_before_newer -= 1
+
+            return False
+
+        return True
+
+    def mark_indexing(self, article_id, version_id):
+        self.calls.append(("mark_indexing", article_id, version_id))
 
     def write_chunks(self, version_id, contents):
         self.calls.append(("write_chunks", version_id, contents))
@@ -79,8 +96,11 @@ class FakeStore:
 
         return self._published
 
-    def mark_failed(self, article_id):
-        self.calls.append(("mark_failed", article_id))
+    def prune(self, article_id):
+        self.calls.append(("prune", article_id))
+
+    def mark_failed(self, article_id, version_id):
+        self.calls.append(("mark_failed", article_id, version_id))
 
 
 class FakeResolver:
@@ -150,6 +170,7 @@ class Pipeline:
             job=built.get("job", JOB),
             stored=built.get("stored", ()),
             published=built.get("published", True),
+            superseded_after=built.get("superseded_after"),
         )
         self.resolver = FakeResolver(
             self.journal,
@@ -185,16 +206,20 @@ def test_a_version_is_chunked_embedded_and_published():
 
     assert pipeline.steps() == [
         "job",
+        "superseded",
         "mark_indexing",
         "resolve",
         "for_provider",
         "write_chunks",
         "embedded",
+        "superseded",
         "embed",
         "write_embeddings",
         "publish",
     ]
     assert pipeline.entry("job") == ("job", 7)
+    assert pipeline.entry("superseded") == ("superseded", 7)
+    assert pipeline.entry("mark_indexing") == ("mark_indexing", 3, 7)
     assert pipeline.entry("publish") == ("publish", 3, 7, 2)
 
 
@@ -214,7 +239,8 @@ def test_a_kb_api_that_is_down_stops_the_job_before_it_writes():
     with pytest.raises(TransientError):
         pipeline.handle()
 
-    assert pipeline.steps() == ["job", "mark_indexing", "resolve"]
+    # The version is still the newest, so the failure stands.
+    assert pipeline.steps() == ["job", "superseded", "mark_indexing", "resolve", "superseded"]
 
 
 def test_the_chunks_carry_the_subject_and_the_headings():
@@ -247,7 +273,7 @@ def test_a_space_without_vector_search_is_indexed_without_vectors(caplog):
     with caplog.at_level("INFO"):
         pipeline.handle()
 
-    assert pipeline.steps() == ["job", "mark_indexing", "resolve", "write_chunks", "publish"]
+    assert pipeline.steps() == ["job", "superseded", "mark_indexing", "resolve", "write_chunks", "publish"]
     assert "for_provider" not in pipeline.steps()
     assert caplog.records[-1].embedded == 0
     assert caplog.records[-1].model_id == 0
@@ -274,8 +300,7 @@ def test_a_repeat_of_a_delivery_calls_no_provider_at_all():
 
 
 def test_every_batch_is_stored_before_the_next_one_is_asked_for():
-    long_body = "\n\n".join(f"## Розділ {number}\n\nТекст розділу." for number in range(6))
-    pipeline = Pipeline(job=replace(JOB, body_markdown=long_body), batch=2)
+    pipeline = Pipeline(job=replace(JOB, body_markdown=LONG_BODY), batch=2)
 
     pipeline.handle()
 
@@ -320,7 +345,7 @@ def test_a_provider_this_worker_cannot_call_is_refused_before_anything_is_writte
     with pytest.raises(PermanentError, match="unsupported embedding provider"):
         pipeline.handle()
 
-    assert pipeline.steps() == ["job", "mark_indexing", "resolve", "for_provider"]
+    assert pipeline.steps() == ["job", "superseded", "mark_indexing", "resolve", "for_provider", "superseded"]
 
 
 @pytest.mark.parametrize(
@@ -409,8 +434,7 @@ EMBEDDINGS = {
 
 
 def test_every_call_to_the_provider_is_timed_under_its_model():
-    long_body = "\n\n".join(f"## Розділ {number}\n\nТекст розділу." for number in range(6))
-    pipeline = Pipeline(job=replace(JOB, body_markdown=long_body), batch=2)
+    pipeline = Pipeline(job=replace(JOB, body_markdown=LONG_BODY), batch=2)
 
     pipeline.handle()
 
@@ -436,7 +460,75 @@ def test_giving_up_marks_the_article_failed():
 
     pipeline.handler.give_up(EVENT)
 
-    assert pipeline.journal == [("mark_failed", 3)]
+    assert pipeline.journal == [("mark_failed", 3, 7)]
+
+
+def test_a_version_with_a_newer_one_is_left_to_the_newer_job(caplog):
+    pipeline = Pipeline(superseded_after=0)
+
+    with caplog.at_level("INFO"):
+        pipeline.handle()
+
+    assert pipeline.steps() == ["job", "superseded", "prune"]
+    assert pipeline.entry("prune") == ("prune", 3)
+    assert caplog.records[-1].message == "superseded by a newer version"
+    assert pipeline.recorded.points("webitel.kb.article.index.duration") == []
+
+
+def test_a_newer_version_stops_the_embedding_before_the_next_batch():
+    # Newest at the start and at the first batch; a newer version before the second.
+    pipeline = Pipeline(job=replace(JOB, body_markdown=LONG_BODY), batch=2, superseded_after=2)
+
+    pipeline.handle()
+
+    assert len(pipeline.entries("embed")) == 1
+    assert len(pipeline.entries("write_embeddings")) == 1
+    assert "publish" not in pipeline.steps()
+    assert pipeline.steps()[-2:] == ["superseded", "prune"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        PermanentError("the database refused the statement: chunk is not present"),
+        TransientError("the provider returned status 503"),
+    ],
+    ids=["permanent", "transient"],
+)
+def test_a_failure_of_a_version_a_newer_one_replaced_ends_quietly(failure):
+    # Newest at the start and at the batch; the newer version is there by the failure.
+    pipeline = Pipeline(failure=failure, superseded_after=2)
+
+    pipeline.handle()
+
+    assert pipeline.steps()[-3:] == ["embed", "superseded", "prune"]
+    assert "publish" not in pipeline.steps()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        PermanentError("the provider returned status 400"),
+        TransientError("the provider returned status 503"),
+    ],
+    ids=["permanent", "transient"],
+)
+def test_a_failure_of_the_newest_version_stands(failure):
+    pipeline = Pipeline(failure=failure)
+
+    with pytest.raises(type(failure)):
+        pipeline.handle()
+
+    assert "prune" not in pipeline.steps()
+
+
+def test_a_bug_is_reported_even_when_the_version_is_no_longer_needed():
+    pipeline = Pipeline(failure=RuntimeError("unexpected"), superseded_after=2)
+
+    with pytest.raises(RuntimeError):
+        pipeline.handle()
+
+    assert pipeline.steps()[-1] == "embed"
 
 
 def test_the_chunk_policy_is_the_one_it_was_given():
