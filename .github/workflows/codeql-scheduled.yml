@@ -28,6 +28,6 @@ jobs:
 
     with:
       languages: '[{"language":"python","build-mode":"none"},{"language":"actions","build-mode":"none"}]'
-      analysis-key: .github/workflows/python-checks.yml:analyze
+      analysis-key: .github/workflows/workflow.yml:analyze
       runs-on: arc-python-runner-set
       max-age-days: ${{ fromJSON(inputs.force && '0' || '7') }}

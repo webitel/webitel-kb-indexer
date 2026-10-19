@@ -4,7 +4,7 @@ version: 1
 source:
   repository: webitel/reusable-configs
   config: python/sync.yml
-  sha: 2e99e2f2f50917905951522fbad9ab2b690dd8d7
+  sha: dfbdf1fa6ebaa294eb5501ec8fa7de630ce029eb
 files:
   .editorconfig:
     source: python/configs/.editorconfig
@@ -23,7 +23,7 @@ files:
     sha256: c23ab5c2fec1713ce637e0c697b94aee74e41c408411dd3413ff8297b8c58d2b
   .github/workflows/codeql-scheduled.yml:
     source: common/workflows/codeql-scheduled.yml.njk
-    sha256: 6fe8b8a5b7a7ac001e9f0b1ea7ebf931002c399c9560ac7527afb129f9c48ee8
+    sha256: 44357e8c664a215ada28b27835a5772a738d03ab6f208ced9d6a1a4a96ad70f9
   .github/workflows/dependabot-auto-merge.yml:
     source: common/workflows/dependabot-auto-merge.yml
     sha256: 3f9a2526900d4505d509e45ee406c6cccfaaca7e1661f7919863019e74fdcdc2
