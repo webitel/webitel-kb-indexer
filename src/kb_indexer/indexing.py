@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from typing import Protocol
 
 from kb_indexer import chunking
-from kb_indexer.embedding import CredentialRefusedError, Embedder
+from kb_indexer.embedding import Embedder
 from kb_indexer.events import ArticleReindex
 from kb_indexer.handler import PermanentError, TransientError
 from kb_indexer.metrics import Metrics
@@ -25,16 +25,16 @@ class Storage(Protocol):
         """Read the version to index."""
         ...
 
-    def superseded(self, version_id: int) -> bool:
-        """Whether the article has a newer version than this one."""
+    def superseded(self, version_id: int, model_id: int) -> bool:
+        """Whether a newer version or another model of the space took over."""
         ...
 
-    def mark_indexing(self, article_id: int, version_id: int) -> None:
-        """Record that the article is being indexed, unless a newer version speaks for it."""
+    def mark_indexing(self, article_id: int, version_id: int, model_id: int) -> None:
+        """Record that the article is being indexed, unless a newer job speaks for it."""
         ...
 
-    def mark_failed(self, article_id: int, version_id: int) -> None:
-        """Record that the article was not indexed, unless a newer version speaks for it."""
+    def mark_failed(self, article_id: int, version_id: int, model_id: int | None) -> None:
+        """Record that the article was not indexed, unless a newer job speaks for it."""
         ...
 
     def write_chunks(self, version_id: int, contents: list[str]) -> list[int]:
@@ -55,12 +55,12 @@ class Storage(Protocol):
         """Store the vectors of the chunks of a job under the model, in the column of its size."""
         ...
 
-    def publish(self, article_id: int, version_id: int, version_number: int) -> bool:
+    def publish(self, article_id: int, version_id: int, version_number: int, model_id: int) -> bool:
         """Point the article at the version and drop what is no longer published."""
         ...
 
     def prune(self, article_id: int) -> None:
-        """Drop the chunks of the versions older than the published one."""
+        """Drop the chunks older than the published version and the vectors of other models."""
         ...
 
 
@@ -85,7 +85,7 @@ class Providing(Protocol):
 
 
 class _SupersededError(Exception):
-    """The article has a newer version, and its own job does the rest."""
+    """A newer version or another model of the space took over, and its own job does the rest."""
 
 
 class IndexingHandler:
@@ -121,27 +121,27 @@ class IndexingHandler:
             self._leave(event, job)
         except (PermanentError, TransientError):
             # A failure of a version nobody needs anymore is not a failure.
-            if not self._store.superseded(job.version_id):
+            if not self._store.superseded(job.version_id, job.model_id):
                 raise
 
             self._leave(event, job)
 
     def give_up(self, event: ArticleReindex) -> None:
         """Record that the article will not be indexed from this event."""
-        self._store.mark_failed(event.article_id, event.version_id)
+        self._store.mark_failed(event.article_id, event.version_id, None)
 
     def _index(self, event: ArticleReindex, job: Job) -> None:
         """Chunk, embed and publish one version."""
         self._ensure_newest(job)
-        self._store.mark_indexing(job.article_id, job.version_id)
+        self._store.mark_indexing(job.article_id, job.version_id, job.model_id)
 
-        model = self._resolver.resolve(job.space_id)
+        model = self._model(job)
         embedder = None if model is None else self._providers.for_provider(model.provider)
 
         chunks = chunking.split(job.body_markdown, title=job.subject, policy=self._policy)
         written = self._store.write_chunks(job.version_id, chunks)
         embedded = 0 if model is None or embedder is None else self._embed(job, model, embedder, written, chunks)
-        published = self._store.publish(job.article_id, job.version_id, job.version_number)
+        published = self._store.publish(job.article_id, job.version_id, job.version_number, job.model_id)
 
         lag = self._metrics.indexed(event.occurred_at, embedded=model is not None) if published else None
 
@@ -158,14 +158,31 @@ class IndexingHandler:
         )
 
     def _leave(self, event: ArticleReindex, job: Job) -> None:
-        """End a job a newer version took over, keeping only what is published."""
+        """End a job a newer one took over, keeping only what is published."""
         self._store.prune(job.article_id)
-        log.info("superseded by a newer version", extra=event.as_fields())
+        log.info("superseded by a newer version or model", extra=event.as_fields())
 
     def _ensure_newest(self, job: Job) -> None:
-        """Stop the work once a newer version exists."""
-        if self._store.superseded(job.version_id):
+        """Stop the work once a newer version or another model of the space exists."""
+        if self._store.superseded(job.version_id, job.model_id):
             raise _SupersededError
+
+    def _model(self, job: Job) -> SpaceEmbedding | None:
+        """The model of the space, the one the job read from the database."""
+        model = self._resolver.resolve(job.space_id)
+        if _model_id(model) == job.model_id:
+            return model
+
+        # The cache may still hold the model the space had before.
+        self._resolver.forget(job.space_id)
+        model = self._resolver.resolve(job.space_id)
+        if _model_id(model) == job.model_id:
+            return model
+
+        self._ensure_newest(job)
+
+        msg = f"kb-api resolves model {_model_id(model)} for space {job.space_id}, the database holds {job.model_id}"
+        raise TransientError(msg)
 
     def _embed(
         self,
@@ -190,9 +207,9 @@ class IndexingHandler:
             self._ensure_newest(job)
             try:
                 vectors = self._call(model, embedder, [content for _chunk_id, content in batch])
-            except CredentialRefusedError:
-                # The stored credential changed under us: ask kb-api again
-                # rather than wait the cache out.
+            except TransientError:
+                # The key or the address of the model may have changed under
+                # us: the retry asks kb-api again rather than wait the cache out.
                 self._resolver.forget(job.space_id)
 
                 raise
@@ -235,6 +252,10 @@ def _batched(pending: list[tuple[int, str]], size: int) -> Iterator[list[tuple[i
     """Cut the work into the calls one provider takes."""
     for start in range(0, len(pending), size):
         yield pending[start : start + size]
+
+
+def _model_id(model: SpaceEmbedding | None) -> int:
+    return 0 if model is None else model.model_id
 
 
 def _absent(job: Job | None) -> str:

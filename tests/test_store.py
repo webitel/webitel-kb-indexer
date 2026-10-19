@@ -20,6 +20,7 @@ JOB = Job(
     body_markdown="# Скидання\n\nТекст.",
     article_deleted=False,
     chunking_strategy="recursive_markdown",
+    model_id=4,
 )
 
 
@@ -116,6 +117,7 @@ def test_the_job_is_read_by_version_alone():
     assert params == {"version_id": 7}
     assert "SELECT v.id AS version_id, v.article_id, a.space_id, s.domain_id," in compact(sql)
     assert "JOIN kb.article a ON a.id = v.article_id" in sql
+    assert "CASE WHEN s.vector_search_enabled THEN COALESCE(s.embedding_model_id, 0) ELSE 0 END AS model_id" in sql
     assert "JOIN kb.space s ON s.id = a.space_id" in sql
     assert "WHERE v.id = %(version_id)s" in sql
 
@@ -141,11 +143,11 @@ SUPERSEDED = [(True,)]
 def test_the_state_of_the_newest_version_is_recorded_under_the_article_lock(mark, state):
     store, cursor = build(results=[LOCKED, NEWEST, []])
 
-    getattr(store, mark)(3, 7)
+    getattr(store, mark)(3, 7, 4)
 
     lock, newer, update = cursor.calls
     assert lock == ("SELECT 1 FROM kb.article WHERE id = %(article_id)s FOR UPDATE", {"article_id": 3})
-    assert newer[1] == {"version_id": 7}
+    assert newer[1] == {"version_id": 7, "model_id": 4}
     assert update[1] == {"article_id": 3, "version_id": 7, "state": state, "indexed": INDEXED}
     assert "UPDATE kb.article SET index_state = %(state)s WHERE id = %(article_id)s" in update[0]
     # A repeat of an indexed version must not take the article back; a reindex
@@ -157,7 +159,7 @@ def test_the_state_of_the_newest_version_is_recorded_under_the_article_lock(mark
 def test_a_superseded_version_leaves_the_state_to_the_newer_one(mark):
     store, cursor = build(results=[LOCKED, SUPERSEDED])
 
-    getattr(store, mark)(3, 7)
+    getattr(store, mark)(3, 7, 4)
 
     assert len(cursor.calls) == 2
     assert not any(sql.startswith("UPDATE") for sql in cursor.statements())
@@ -167,7 +169,7 @@ def test_the_state_check_and_write_are_one_transaction():
     pool = FakePool(FakeCursor([LOCKED, NEWEST, []]))
     store = Store(cast(ConnectionPool[Connection[TupleRow]], pool))
 
-    store.mark_failed(3, 7)
+    store.mark_failed(3, 7, 4)
 
     assert pool.connection_calls == 1
 
@@ -176,13 +178,37 @@ def test_the_state_check_and_write_are_one_transaction():
 def test_a_version_is_superseded_by_any_newer_version_of_its_article(answer, superseded):
     store, cursor = build(results=[answer])
 
-    assert store.superseded(7) is superseded
+    assert store.superseded(7, 4) is superseded
 
     sql, params = cursor.calls[0]
-    assert params == {"version_id": 7}
+    assert params == {"version_id": 7, "model_id": 4}
     assert "JOIN kb.article_version newer" in sql
     assert "newer.article_id = mine.article_id AND newer.version_number > mine.version_number" in sql
     assert "WHERE mine.id = %(version_id)s" in sql
+
+
+def test_a_version_is_superseded_once_the_space_searches_with_another_model():
+    store, cursor = build(results=[NEWEST])
+
+    store.superseded(7, 4)
+
+    sql, _params = cursor.calls[0]
+    assert "OR EXISTS (" in sql
+    assert "JOIN kb.space s ON s.id = a.space_id WHERE mine.id = %(version_id)s" in sql
+    assert (
+        "CASE WHEN s.vector_search_enabled THEN COALESCE(s.embedding_model_id, 0) ELSE 0 END <> %(model_id)s::bigint"
+    ) in sql
+
+
+def test_giving_up_checks_only_for_a_newer_version():
+    store, cursor = build(results=[LOCKED, NEWEST, []])
+
+    store.mark_failed(3, 7, None)
+
+    _lock, newer, update = cursor.calls
+    assert newer[1] == {"version_id": 7, "model_id": None}
+    assert "%(model_id)s::bigint IS NOT NULL" in newer[0]
+    assert update[1]["state"] == FAILED
 
 
 def test_chunks_are_written_without_duplicating_what_is_there():
@@ -235,7 +261,7 @@ def test_the_chunks_that_already_carry_a_vector_are_named():
 
 
 @pytest.mark.parametrize("dimensions", [768, 1024])
-def test_a_vector_replaces_the_one_the_chunk_carried_in_the_column_of_its_size(dimensions):
+def test_a_vector_is_written_once_in_the_column_of_its_size(dimensions):
     store, cursor = build()
 
     store.write_embeddings(JOB, 4, dimensions, [(11, [1.0, 0.0]), (12, [0.0, 1.0])])
@@ -244,7 +270,7 @@ def test_a_vector_replaces_the_one_the_chunk_carried_in_the_column_of_its_size(d
     sql, rows = cursor.calls[0]
     assert f"INSERT INTO kb.chunk_embedding (chunk_id, model_id, domain_id, space_id, {column})" in sql
     assert "%(embedding)s::vector" in sql
-    assert f"ON CONFLICT (chunk_id, model_id) DO UPDATE SET {column} = EXCLUDED.{column}" in sql
+    assert "ON CONFLICT (chunk_id, model_id) DO NOTHING" in sql
     assert rows == [
         {"chunk_id": 11, "model_id": 4, "domain_id": 1, "space_id": 5, "embedding": "[1.0,0.0]"},
         {"chunk_id": 12, "model_id": 4, "domain_id": 1, "space_id": 5, "embedding": "[0.0,1.0]"},
@@ -274,19 +300,20 @@ def test_a_vector_is_written_the_way_pgvector_reads_one():
     ],
 )
 def test_publishing_reports_whether_this_version_is_the_published_one(pointer, published):
-    store, _cursor = build(results=[LOCKED, NEWEST, pointer, []])
+    store, _cursor = build(results=[LOCKED, NEWEST, pointer, [], []])
 
-    assert store.publish(3, 7, 2) is published
+    assert store.publish(3, 7, 2, 4) is published
 
 
 @pytest.mark.parametrize(("answer", "newest"), [(NEWEST, True), (SUPERSEDED, False)])
 def test_the_pointer_moves_only_forward_and_only_the_newest_version_records_the_state(answer, newest):
-    store, cursor = build(results=[LOCKED, answer, [(7,)], []])
+    store, cursor = build(results=[LOCKED, answer, [(7,)], [], []])
 
-    store.publish(3, 7, 2)
+    store.publish(3, 7, 2, 4)
 
-    lock, _newer, update, _retention = cursor.calls
+    lock, newer, update, _retention, _foreign = cursor.calls
     assert "FOR UPDATE" in lock[0]
+    assert newer[1] == {"version_id": 7, "model_id": 4}
     sql, params = update
     assert params == {"article_id": 3, "version_id": 7, "version_number": 2, "state": INDEXED, "newest": newest}
     assert "%(version_number)s > (" in sql
@@ -295,9 +322,9 @@ def test_the_pointer_moves_only_forward_and_only_the_newest_version_records_the_
 
 
 def test_only_versions_older_than_the_published_one_lose_their_chunks():
-    store, cursor = build(results=[LOCKED, NEWEST, [(7,)], []])
+    store, cursor = build(results=[LOCKED, NEWEST, [(7,)], [], []])
 
-    store.publish(3, 7, 2)
+    store.publish(3, 7, 2, 4)
 
     sql, params = cursor.calls[3]
     assert params == {"article_id": 3}
@@ -307,10 +334,10 @@ def test_only_versions_older_than_the_published_one_lose_their_chunks():
 
 
 def test_the_swap_and_the_cleanup_are_one_transaction():
-    pool = FakePool(FakeCursor([LOCKED, NEWEST, [(7,)], []]))
+    pool = FakePool(FakeCursor([LOCKED, NEWEST, [(7,)], [], []]))
     store = Store(cast(ConnectionPool[Connection[TupleRow]], pool))
 
-    store.publish(3, 7, 2)
+    store.publish(3, 7, 2, 4)
 
     assert pool.connection_calls == 1
 
@@ -320,10 +347,27 @@ def test_pruning_drops_only_what_is_older_than_the_published_version():
 
     store.prune(3)
 
-    [(sql, params)] = cursor.calls
+    (sql, params), _foreign = cursor.calls
     assert params == {"article_id": 3}
     assert "DELETE FROM kb.chunk c" in sql
     assert "v.version_number < (" in sql
+
+
+@pytest.mark.parametrize(
+    ("operation", "arguments", "position"),
+    [("publish", (3, 7, 2, 4), 4), ("prune", (3,), 1)],
+)
+def test_the_vectors_of_a_model_the_space_no_longer_has_are_dropped(operation, arguments, position):
+    store, cursor = build(results=[LOCKED, NEWEST, [(7,)], [], []])
+
+    getattr(store, operation)(*arguments)
+
+    assert len(cursor.calls) == position + 1
+    sql, params = cursor.calls[position]
+    assert params == {"article_id": 3}
+    assert "DELETE FROM kb.chunk_embedding e" in sql
+    assert "v.article_id = %(article_id)s" in sql
+    assert "e.model_id IS DISTINCT FROM s.embedding_model_id" in sql
 
 
 def test_a_database_that_is_down_is_worth_another_attempt():
