@@ -171,6 +171,21 @@ SELECT chunk_id FROM kb.chunk_embedding
 WHERE model_id = %(model_id)s AND chunk_id = ANY(%(chunk_ids)s)
 """
 
+# Locks the article's space before the article.
+LOCK_ARTICLE_SPACE_SQL = """
+SELECT s.id FROM kb.article a JOIN kb.space s ON s.id = a.space_id
+WHERE a.id = %(article_id)s
+FOR KEY SHARE OF s
+"""
+
+# Holds a move off until the vectors commit.
+SHARE_ARTICLE_SQL = """
+SELECT space_id FROM kb.article WHERE id = %(article_id)s FOR SHARE
+"""
+
+# Writes retried when the article moves between the locks.
+SPACE_ATTEMPTS = 3
+
 # One vector per chunk and model. A repeat keeps the stored one: a chunk whose
 # text changed has lost its vectors already, so the same model gave the same
 # vector, and taking no row lock keeps a model switch from deadlocking with it.
@@ -290,20 +305,36 @@ class Store:
         dimensions: int,
         vectors: list[tuple[int, list[float]]],
     ) -> None:
-        """Store the vectors of the chunks of a job under the model, in the column of its size."""
-        rows = [
-            {
-                "chunk_id": chunk_id,
-                "model_id": model_id,
-                "domain_id": job.domain_id,
-                "space_id": job.space_id,
-                "embedding": vector_literal(vector),
-            }
-            for chunk_id, vector in vectors
-        ]
+        """Store the vectors of the chunks of a job under the model, in the column of its size.
 
-        with self._connection() as connection, connection.cursor() as cursor:
-            cursor.executemany(write_embedding_sql(dimensions), rows)
+        The scope is the space the article is in now, not the one the job read.
+        """
+        for _attempt in range(SPACE_ATTEMPTS):
+            with self._connection() as connection, connection.cursor() as cursor:
+                space_id = _space_of(cursor, LOCK_ARTICLE_SPACE_SQL, job.article_id)
+                if space_id is None:
+                    # The article is gone for good, and its chunks with it.
+                    return
+
+                if _space_of(cursor, SHARE_ARTICLE_SQL, job.article_id) != space_id:
+                    continue
+
+                rows = [
+                    {
+                        "chunk_id": chunk_id,
+                        "model_id": model_id,
+                        "domain_id": job.domain_id,
+                        "space_id": space_id,
+                        "embedding": vector_literal(vector),
+                    }
+                    for chunk_id, vector in vectors
+                ]
+                cursor.executemany(write_embedding_sql(dimensions), rows)
+
+                return
+
+        msg = f"article {job.article_id} kept moving between spaces"
+        raise TransientError(msg)
 
     def _mark(self, article_id: int, version_id: int, model_id: int | None, state: int) -> None:
         with self._connection() as connection, connection.cursor() as cursor:
@@ -328,6 +359,14 @@ class Store:
         except psycopg.Error as refused:
             msg = f"the database refused the statement: {refused}"
             raise PermanentError(msg) from refused
+
+
+def _space_of(cursor: Cursor[TupleRow], sql: str, article_id: int) -> int | None:
+    """The space a lock statement found the article in, None once it is gone."""
+    cursor.execute(sql, {"article_id": article_id})
+    found = cursor.fetchone()
+
+    return None if found is None else int(found[0])
 
 
 def _superseded(cursor: Cursor[TupleRow], version_id: int, model_id: int | None) -> bool:

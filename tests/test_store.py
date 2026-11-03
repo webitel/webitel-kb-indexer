@@ -262,12 +262,12 @@ def test_the_chunks_that_already_carry_a_vector_are_named():
 
 @pytest.mark.parametrize("dimensions", [768, 1024])
 def test_a_vector_is_written_once_in_the_column_of_its_size(dimensions):
-    store, cursor = build()
+    store, cursor = build(results=[[(5,)], [(5,)]])
 
     store.write_embeddings(JOB, 4, dimensions, [(11, [1.0, 0.0]), (12, [0.0, 1.0])])
 
     column = f"embedding_{dimensions}"
-    sql, rows = cursor.calls[0]
+    sql, rows = cursor.calls[2]
     assert f"INSERT INTO kb.chunk_embedding (chunk_id, model_id, domain_id, space_id, {column})" in sql
     assert "%(embedding)s::vector" in sql
     assert "ON CONFLICT (chunk_id, model_id) DO NOTHING" in sql
@@ -278,7 +278,7 @@ def test_a_vector_is_written_once_in_the_column_of_its_size(dimensions):
 
 
 def test_the_vectors_of_one_job_are_written_in_one_transaction():
-    pool = FakePool(FakeCursor([]))
+    pool = FakePool(FakeCursor([[(5,)], [(5,)]]))
     store = Store(cast(ConnectionPool[Connection[TupleRow]], pool))
 
     store.write_embeddings(JOB, 4, 768, [(11, [1.0]), (12, [0.0])])
