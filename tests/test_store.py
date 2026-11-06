@@ -115,7 +115,7 @@ def test_the_job_is_read_by_version_alone():
 
     sql, params = cursor.calls[0]
     assert params == {"version_id": 7}
-    assert "SELECT v.id AS version_id, v.article_id, a.space_id, s.domain_id," in compact(sql)
+    assert "SELECT v.id AS version_id, v.article_id, a.space_id, s.dc AS domain_id," in compact(sql)
     assert "JOIN kb.article a ON a.id = v.article_id" in sql
     assert "CASE WHEN s.vector_search_enabled THEN COALESCE(s.embedding_model_id, 0) ELSE 0 END AS model_id" in sql
     assert "JOIN kb.space s ON s.id = a.space_id" in sql
@@ -268,7 +268,7 @@ def test_a_vector_is_written_once_in_the_column_of_its_size(dimensions):
 
     column = f"embedding_{dimensions}"
     sql, rows = cursor.calls[2]
-    assert f"INSERT INTO kb.chunk_embedding (chunk_id, model_id, domain_id, space_id, {column})" in sql
+    assert f"INSERT INTO kb.chunk_embedding (chunk_id, model_id, dc, space_id, {column})" in sql
     assert "%(embedding)s::vector" in sql
     assert "ON CONFLICT (chunk_id, model_id) DO NOTHING" in sql
     assert rows == [

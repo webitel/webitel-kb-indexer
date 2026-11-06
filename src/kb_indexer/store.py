@@ -34,7 +34,7 @@ JOB_SQL = f"""
 SELECT v.id AS version_id,
        v.article_id,
        a.space_id,
-       s.domain_id,
+       s.dc AS domain_id,
        v.version_number,
        v.subject,
        v.body_markdown,
@@ -193,7 +193,7 @@ SPACE_ATTEMPTS = 3
 # ranks. Every vector size has its own column, embedding_<dimensions>, named
 # by write_embedding_sql.
 _WRITE_EMBEDDING_SQL = """
-INSERT INTO kb.chunk_embedding (chunk_id, model_id, domain_id, space_id, {column})
+INSERT INTO kb.chunk_embedding (chunk_id, model_id, dc, space_id, {column})
 VALUES (%(chunk_id)s, %(model_id)s, %(domain_id)s, %(space_id)s, %(embedding)s::vector)
 ON CONFLICT (chunk_id, model_id) DO NOTHING
 """
